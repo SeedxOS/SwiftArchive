@@ -175,6 +175,7 @@ public enum ArchiveErrorCode: Int32, Sendable {
     case cancelled = 13
     case unsupportedFeature = 14
     case `internal` = 15
+    case missingVolume = 16
 }
 
 public struct ArchiveError: Error, Sendable, Equatable, LocalizedError {

@@ -1,9 +1,9 @@
 import CSwiftArchiveCore
 import Foundation
 
-private final class ProgressContext: @unchecked Sendable {
+final class ProgressContext: @unchecked Sendable {
     private let lock = NSLock()
-    private var isCancelled = false
+    private var cancelled = false
     let handler: (@Sendable (ArchiveProgress) -> Bool)?
 
     init(handler: (@Sendable (ArchiveProgress) -> Bool)?) {
@@ -12,21 +12,38 @@ private final class ProgressContext: @unchecked Sendable {
 
     func cancel() {
         lock.lock()
-        isCancelled = true
+        cancelled = true
         lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
     }
 
     func shouldContinue(_ value: ArchiveProgress) -> Bool {
         lock.lock()
-        let cancelled = isCancelled
+        let wasCancelled = cancelled
         lock.unlock()
-        return !cancelled && (handler?(value) ?? true)
+        return !wasCancelled && (handler?(value) ?? true)
+    }
+
+    func reportCompletion(totalSize: UInt64) {
+        _ = shouldContinue(ArchiveProgress(
+            entryIndex: 0,
+            entryPath: "",
+            entryCompleted: totalSize,
+            entryTotal: totalSize,
+            totalCompleted: totalSize,
+            totalSize: totalSize
+        ))
     }
 }
 
-private final class DataContext: @unchecked Sendable {
+final class DataContext: @unchecked Sendable {
     private let lock = NSLock()
-    private var isCancelled = false
+    private var cancelled = false
     var data = Data()
     let consumer: (@Sendable (Data) -> Bool)?
 
@@ -36,21 +53,35 @@ private final class DataContext: @unchecked Sendable {
 
     func cancel() {
         lock.lock()
-        isCancelled = true
+        cancelled = true
         lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
     }
 
     func consume(_ bytes: UnsafePointer<UInt8>, count: Int) -> Bool {
         lock.lock()
-        let cancelled = isCancelled
+        let wasCancelled = cancelled
         lock.unlock()
-        guard !cancelled else { return false }
+        guard !wasCancelled else { return false }
         let chunk = Data(bytes: bytes, count: count)
         if let consumer {
             return consumer(chunk)
         }
         data.append(chunk)
         return true
+    }
+
+    func consume(_ chunk: Data) -> Bool {
+        guard !chunk.isEmpty else { return true }
+        return chunk.withUnsafeBytes { bytes in
+            guard let baseAddress = bytes.bindMemory(to: UInt8.self).baseAddress else { return true }
+            return consume(baseAddress, count: chunk.count)
+        }
     }
 }
 
@@ -79,14 +110,47 @@ public final class ArchiveReader: @unchecked Sendable {
     public let format: ArchiveFormat
     public let entries: [ArchiveEntry]
 
-    private let handle: OpaquePointer
+    private let handle: OpaquePointer?
+    private let sevenZipBackend: SevenZipBackend?
     private let operationLock = NSLock()
 
-    public init(
+    public convenience init(
         url: URL,
         format requestedFormat: ArchiveFormat? = nil,
         options: ArchiveOpenOptions = .init()
     ) throws {
+        try self.init(urls: [url], format: requestedFormat, options: options)
+    }
+
+    public init(
+        urls: [URL],
+        format requestedFormat: ArchiveFormat? = nil,
+        options: ArchiveOpenOptions = .init()
+    ) throws {
+        var seenPaths = Set<String>()
+        let urls = urls.filter { seenPaths.insert($0.standardizedFileURL.path).inserted }
+        guard let url = urls.first else {
+            throw ArchiveError(
+                code: .invalidArgument,
+                backendCode: 0,
+                message: "At least one archive URL is required"
+            )
+        }
+        if SevenZipBackend.shouldHandle(urls: urls, requestedFormat: requestedFormat) {
+            let backend = try SevenZipBackend(
+                urls: urls,
+                password: options.password,
+                limits: options.limits
+            )
+            self.url = backend.primaryURL
+            format = .sevenZip
+            entries = backend.entries
+            handle = nil
+            sevenZipBackend = backend
+            return
+        }
+
+        sevenZipBackend = nil
         var error = SAError()
         var nativeOptions = swiftarchive_open_options_default()
         nativeOptions.filename_encoding = SAFilenameEncoding(rawValue: UInt32(options.filenameEncoding.rawValue))
@@ -183,11 +247,17 @@ public final class ArchiveReader: @unchecked Sendable {
     }
 
     deinit {
-        swiftarchive_archive_close(handle)
+        if let handle {
+            swiftarchive_archive_close(handle)
+        }
     }
 
     public func cancel() {
-        swiftarchive_archive_cancel(handle)
+        if let sevenZipBackend {
+            sevenZipBackend.cancel()
+        } else if let handle {
+            swiftarchive_archive_cancel(handle)
+        }
     }
 
     public func extract(
@@ -263,6 +333,13 @@ public final class ArchiveReader: @unchecked Sendable {
     ) throws {
         operationLock.lock()
         defer { operationLock.unlock() }
+        if let sevenZipBackend {
+            try sevenZipBackend.extract(to: destinationURL, options: options, context: context)
+            return
+        }
+        guard let handle else {
+            throw ArchiveError(code: .internal, backendCode: 0, message: "Archive backend is unavailable")
+        }
         var error = SAError()
         var nativeOptions = swiftarchive_extraction_options_default()
         switch options.overwritePolicy {
@@ -291,6 +368,13 @@ public final class ArchiveReader: @unchecked Sendable {
         }
         operationLock.lock()
         defer { operationLock.unlock() }
+        if let sevenZipBackend {
+            try sevenZipBackend.read(entry: entry, context: context)
+            return
+        }
+        guard let handle else {
+            throw ArchiveError(code: .internal, backendCode: 0, message: "Archive backend is unavailable")
+        }
         var error = SAError()
         let opaque = Unmanaged.passUnretained(context).toOpaque()
         let success = swiftarchive_archive_read_entry(
@@ -314,6 +398,18 @@ public final class ArchiveReader: @unchecked Sendable {
         }
         operationLock.lock()
         defer { operationLock.unlock() }
+        if let sevenZipBackend {
+            try sevenZipBackend.extract(
+                entry: entry,
+                to: destinationURL,
+                options: options,
+                context: context
+            )
+            return
+        }
+        guard let handle else {
+            throw ArchiveError(code: .internal, backendCode: 0, message: "Archive backend is unavailable")
+        }
         var error = SAError()
         var nativeOptions = swiftarchive_extraction_options_default()
         switch options.overwritePolicy {

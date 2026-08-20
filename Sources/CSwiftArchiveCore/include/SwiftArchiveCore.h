@@ -64,6 +64,7 @@ typedef enum SAErrorCode {
     SA_ERROR_CANCELLED = 13,
     SA_ERROR_UNSUPPORTED_FEATURE = 14,
     SA_ERROR_INTERNAL = 15,
+    SA_ERROR_MISSING_VOLUME = 16,
 } SAErrorCode;
 
 typedef enum SAEntryKind {

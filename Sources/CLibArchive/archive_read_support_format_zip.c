@@ -699,10 +699,6 @@ process_extra(struct archive_read *a, struct archive_entry *entry,
 			    (int)datasize, (int)(extra_length - offset));
 			return ARCHIVE_FAILED;
 		}
-#ifdef DEBUG
-		fprintf(stderr, "Header id 0x%04x, length %d\n",
-		    headerid, datasize);
-#endif
 		switch (headerid) {
 		case 0x0001:
 			/* Zip64 extended information extra field. */

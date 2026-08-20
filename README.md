@@ -9,11 +9,11 @@ platform archive APIs, or a specific host application.
 
 | Format | List | Stream entries | Extract | Create | Encryption | Multi-volume | Solid |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| ZIP | Yes | Yes | Yes | Yes | ZipCrypto / WinZip AES | Yes | N/A |
+| ZIP / ZIPX | Yes | Yes | Yes | Yes (ZIP) | ZipCrypto / WinZip AES | Yes | N/A |
 | RAR | Yes | Yes | Yes | No | RAR 3/5 | Yes | Yes |
 | TAR | Yes | Yes | Yes | No | N/A | No | N/A |
 | GZIP | Yes (single stream) | Yes | Yes | No | N/A | No | N/A |
-| 7z | Yes | Yes | Yes | No | Not supported by libarchive | No | Yes |
+| 7z | Yes | Yes | Yes | No | 7z AES-256, including encrypted headers | Yes | Yes |
 | BZIP2 / XZ / LZMA / LZIP / Zstandard / LZ4 / Unix Compress | Yes (single stream) | Yes | Yes | No | N/A | No | N/A |
 | CAB / CPIO / ISO 9660 / LHA-LZH / AR / WARC | Yes | Yes | Yes | No | N/A | No | Format dependent |
 
@@ -24,9 +24,15 @@ TAR supports POSIX ustar headers, PAX path/size/time metadata, and GNU long
 names. GZIP exposes its decompressed stream as one regular-file entry and uses
 the original filename from the header when it is safe and valid UTF-8.
 Compressed TAR streams are detected by content and exposed as TAR archives.
-ZIPX files that use methods supported by libarchive can fall back to the
-libarchive backend. Encrypted 7z archives are reported as an unsupported
-feature because libarchive 3.8.9 does not implement 7z encryption.
+ZIPX read and extraction support includes Store, Deflate, Deflate64, BZip2,
+LZMA, PPMd, Zstandard, and XZ. Deflate64 entries can also use ZipCrypto or
+WinZip AES encryption. Less common proprietary ZIP media codecs are reported
+as unsupported instead of being treated as corrupt data.
+
+7z archives are decoded by the LZMA SDK through PLzmaSDK. Content encryption,
+encrypted headers, Unicode passwords, solid archives, and numbered
+`.7z.001` volume sets are supported. Archive creation is intentionally limited
+to ZIP; SwiftArchive does not create 7z or RAR archives.
 
 SwiftArchive also provides:
 
@@ -84,6 +90,22 @@ try await archive.extract(
 }
 ```
 
+Pass all explicitly authorized parts when opening a split 7z archive. URLs may
+be unordered; SwiftArchive resolves the first volume and verifies that the
+numbered set is contiguous:
+
+```swift
+let archive = try ArchiveReader(
+    urls: selectedVolumeURLs,
+    options: .init(password: password)
+)
+```
+
+When the archive parts are ordinary files in one accessible directory,
+opening any `.7z.NNN` part also discovers its siblings. Sandboxed applications
+should still pass every security-scoped URL explicitly because directory
+enumeration does not grant access to sibling files.
+
 Read one entry without writing it to disk:
 
 ```swift
@@ -96,8 +118,8 @@ try await archive.read(archive.entries[0]) { chunk in
 ```
 
 Use `archive.extract(entry, to: destinationURL)` to extract one entry. For a
-solid RAR archive, the backend processes preceding data internally but writes
-only the requested entry to the destination.
+solid RAR or 7z archive, the backend processes the required solid block
+internally but writes only the requested entry to the destination.
 
 ## Creating ZIP Archives
 
@@ -118,7 +140,7 @@ try await ZipArchive.create(
 ```
 
 Set `volumeSize` to create a multi-volume ZIP archive. A value of `0` creates a
-regular single-file archive. SwiftArchive does not create RAR archives.
+regular single-file archive. SwiftArchive does not create 7z or RAR archives.
 
 ## Filename Encodings
 
@@ -153,6 +175,10 @@ SwiftArchive contains separately licensed third-party code:
 - Additional read/extract support uses libarchive 3.8.9. Its optional filters
   are built from vendored XZ Utils/liblzma 5.8.3, bzip2 1.0.8, Zstandard 1.5.7,
   and LZ4 1.10.0 source.
+- Encrypted and multi-volume 7z support uses PLzmaSDK 1.6.1 under the MIT
+  license and its bundled LZMA SDK 26.01 code, which is in the public domain.
+- Deflate64 decoding uses zlib's `contrib/infback9` code under the zlib
+  license.
 - Selected RAR test fixtures come from rarfile and are licensed under the ISC
   license.
 
@@ -184,4 +210,7 @@ multi-volume ZIP, password-protected RAR, encrypted RAR headers, solid archives,
 Unicode paths, multi-volume RAR, TAR listing/extraction/link rejection, and GZIP
 streaming/footer validation. It also covers 7z and compressed TAR streams using
 XZ, bzip2, Zstandard, and LZ4, including Unicode paths, cancellation, unsafe
-paths, and resource limits.
+paths, and resource limits. Dedicated fixtures cover encrypted 7z content and
+headers, Unicode 7z passwords, solid and split 7z archives, missing volumes,
+missing ZIP and RAR volumes, and ZIPX Deflate64, BZip2, LZMA, PPMd, Zstandard,
+and XZ methods.

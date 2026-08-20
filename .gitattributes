@@ -1,0 +1,3 @@
+# Preserve vendored PLzmaSDK formatting so local patches stay reviewable
+# against the recorded upstream revision.
+Vendor/PLzmaSDK/** whitespace=-trailing-space

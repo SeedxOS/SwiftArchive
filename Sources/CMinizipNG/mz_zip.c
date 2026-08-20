@@ -1716,7 +1716,11 @@ static int32_t mz_zip_entry_open_int(void *handle, uint8_t raw, int16_t compress
         err = MZ_OK;
         break;
     default:
-        return MZ_SUPPORT_ERROR;
+        /* SwiftArchive alteration: raw mode intentionally exposes compressed
+         * bytes to an external codec such as Deflate64. */
+        if (!raw)
+            return MZ_SUPPORT_ERROR;
+        break;
     }
 
 #ifndef HAVE_WZAES

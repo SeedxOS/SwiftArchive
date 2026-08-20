@@ -1,0 +1,6 @@
+zlib contrib/infback9
+Commit: e3dc0a85b7032e98380dec011bc8f2c2ee0d8fca
+Source: https://github.com/madler/zlib/tree/develop/contrib/infback9
+
+SwiftArchive alteration: infback9.c uses private local allocation callbacks
+instead of zlib's non-public zcalloc and zcfree symbols.

@@ -80,6 +80,9 @@ let package = Package(
         .library(name: "SwiftArchive", targets: ["SwiftArchive"]),
         .library(name: "CSwiftArchiveCore", targets: ["CSwiftArchiveCore"]),
     ],
+    dependencies: [
+        .package(path: "Vendor/PLzmaSDK"),
+    ],
     targets: [
         .target(
             name: "CLibLZMA",
@@ -225,7 +228,10 @@ let package = Package(
         ),
         .target(
             name: "SwiftArchive",
-            dependencies: ["CSwiftArchiveCore"],
+            dependencies: [
+                "CSwiftArchiveCore",
+                .product(name: "PLzmaSDK", package: "plzmasdk"),
+            ],
             path: "Sources/SwiftArchive",
             resources: [.copy("Resources/PrivacyInfo.xcprivacy")]
         ),

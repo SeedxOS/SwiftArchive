@@ -23,6 +23,7 @@
 #include "mz_zip.h"
 #include "mz_zip_rw.h"
 #include <zlib.h>
+#include "Deflate64/infback9.h"
 
 #include <algorithm>
 #include <atomic>
@@ -59,7 +60,16 @@ struct Entry {
     bool split_before = false;
     bool split_after = false;
     uint64_t data_offset = 0;
+    uint16_t compression_method = MZ_COMPRESS_METHOD_STORE;
 };
+
+constexpr uint16_t kZipMethodDeflate64 = 9;
+
+bool zip_method_uses_minizip(uint16_t method) {
+    return method == MZ_COMPRESS_METHOD_STORE ||
+           method == MZ_COMPRESS_METHOD_DEFLATE ||
+           method == kZipMethodDeflate64;
+}
 
 struct RarCallbackContext {
     const std::string *password = nullptr;
@@ -426,7 +436,12 @@ int CALLBACK rar_callback(UINT message, LPARAM user_data, LPARAM p1, LPARAM p2) 
     }
     case UCM_CHANGEVOLUME:
     case UCM_CHANGEVOLUMEW:
-        return 1;
+        // UnRAR calls with RAR_VOL_ASK only after its automatic attempt to
+        // open the next volume failed. Returning success without changing
+        // the path makes it retry forever, which is unsuitable for a
+        // non-interactive library. Abort promptly and let the caller ask the
+        // user to authorize the missing part.
+        return p2 == RAR_VOL_ASK ? -1 : 1;
     case UCM_LARGEDICT:
         return 1;
     default:
@@ -445,6 +460,8 @@ struct SAArchive {
     std::vector<Entry> entries;
     std::atomic<bool> cancelled{false};
     bool uses_libarchive = false;
+    bool uses_hybrid_zip = false;
+    bool uses_split_zip = false;
 };
 
 namespace {
@@ -486,6 +503,61 @@ std::string lowercase_ascii(std::string value) {
         return static_cast<char>(std::tolower(character));
     });
     return value;
+}
+
+bool rar_path_uses_volume_naming(const std::string &path) {
+    const std::string name = lowercase_ascii(fs::path(path).filename().string());
+    auto is_digits = [](const std::string &value) {
+        return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char character) {
+            return std::isdigit(character) != 0;
+        });
+    };
+
+    if (name.size() > 4 && name.substr(name.size() - 4) == ".rar") {
+        const size_t part = name.rfind(".part", name.size() - 4);
+        if (part != std::string::npos &&
+            is_digits(name.substr(part + 5, name.size() - part - 9)))
+            return true;
+    }
+    const size_t numbered = name.rfind(".rar.");
+    if (numbered != std::string::npos && is_digits(name.substr(numbered + 5)))
+        return true;
+
+    const std::string extension = fs::path(name).extension().string();
+    return extension.size() >= 4 && extension[0] == '.' && extension[1] == 'r' &&
+           is_digits(extension.substr(2));
+}
+
+bool rar_archive_uses_volumes(const SAArchive *archive) {
+    return archive &&
+        (rar_path_uses_volume_naming(archive->path) ||
+         std::any_of(archive->entries.begin(), archive->entries.end(), [](const Entry &entry) {
+             return entry.split_before || entry.split_after;
+         }));
+}
+
+SAErrorCode rar_archive_error_code(const SAArchive *archive, int32_t code) {
+    if (code == ERAR_EOPEN && rar_archive_uses_volumes(archive))
+        return SA_ERROR_MISSING_VOLUME;
+    return unrar_error_code(code, archive && !archive->password.empty());
+}
+
+SAErrorCode zip_archive_error_code(const SAArchive *archive, int32_t code) {
+    if (archive && archive->uses_split_zip) {
+        switch (code) {
+        case MZ_EXIST_ERROR:
+        case MZ_OPEN_ERROR:
+        case MZ_SEEK_ERROR:
+        case MZ_TELL_ERROR:
+        case MZ_READ_ERROR:
+        case MZ_INTERNAL_ERROR:
+        case MZ_BUF_ERROR:
+            return SA_ERROR_MISSING_VOLUME;
+        default:
+            break;
+        }
+    }
+    return minizip_error_code(code, archive && !archive->password.empty());
 }
 
 SAErrorCode libarchive_error_code(struct archive *reader, bool has_password) {
@@ -710,6 +782,8 @@ int32_t require_zip_password(SAArchive *archive, const Entry &entry, SAError *er
 }
 
 int32_t list_zip(SAArchive *archive, SAError *error) {
+    archive->uses_hybrid_zip = false;
+    archive->uses_split_zip = false;
     void *reader = mz_zip_reader_create();
     if (!reader)
         return fail(error, SA_ERROR_INTERNAL, MZ_MEM_ERROR, "Unable to allocate ZIP reader");
@@ -720,6 +794,14 @@ int32_t list_zip(SAArchive *archive, SAError *error) {
         return fail(error, minizip_error_code(result, !archive->password.empty()), result,
                     "Unable to open ZIP archive");
     }
+    void *zip_handle = nullptr;
+    uint32_t central_directory_disk = 0;
+    if (mz_zip_reader_get_zip_handle(reader, &zip_handle) == MZ_OK &&
+        mz_zip_get_disk_number_with_cd(zip_handle, &central_directory_disk) == MZ_OK)
+        archive->uses_split_zip = central_directory_disk > 0;
+    bool requires_libarchive = false;
+    bool contains_deflate64 = false;
+    uint16_t unsupported_method = 0;
     result = mz_zip_reader_goto_first_entry(reader);
     while (result == MZ_OK) {
         mz_zip_file *info = nullptr;
@@ -732,6 +814,12 @@ int32_t list_zip(SAArchive *archive, SAError *error) {
             result = MZ_FORMAT_ERROR;
             break;
         }
+        if (info->compression_method == kZipMethodDeflate64) {
+            contains_deflate64 = true;
+        } else if (!zip_method_uses_minizip(info->compression_method)) {
+            requires_libarchive = true;
+            unsupported_method = info->compression_method;
+        }
         if (mz_zip_attrib_is_symlink(info->external_fa, info->version_madeby) == MZ_OK)
             entry.kind = SA_ENTRY_SYMBOLIC_LINK;
         else if (mz_zip_attrib_is_dir(info->external_fa, info->version_madeby) == MZ_OK ||
@@ -742,14 +830,23 @@ int32_t list_zip(SAArchive *archive, SAError *error) {
         entry.modification_time = static_cast<int64_t>(info->modified_date);
         entry.crc32 = info->crc;
         entry.encrypted = (info->flag & MZ_ZIP_FLAG_ENCRYPTED) != 0;
+        entry.data_offset = archive->entries.size();
+        entry.compression_method = info->compression_method;
         archive->entries.push_back(std::move(entry));
         result = mz_zip_reader_goto_next_entry(reader);
     }
     mz_zip_reader_close(reader);
     mz_zip_reader_delete(&reader);
     if (result != MZ_END_OF_LIST)
-        return fail(error, minizip_error_code(result, !archive->password.empty()), result,
+        return fail(error, zip_archive_error_code(archive, result), result,
                     "Unable to read ZIP directory");
+    if (requires_libarchive && contains_deflate64) {
+        archive->uses_hybrid_zip = true;
+    } else if (requires_libarchive) {
+        return fail(error, SA_ERROR_UNSUPPORTED_FEATURE, MZ_SUPPORT_ERROR,
+                    "ZIP compression method " + std::to_string(unsupported_method) +
+                        " requires the extended ZIP backend");
+    }
     return validate_archive_limits(archive, error);
 }
 
@@ -765,7 +862,7 @@ int32_t list_rar(SAArchive *archive, SAError *error) {
     open_data.UserData = reinterpret_cast<LPARAM>(&callback_context);
     HANDLE handle = RAROpenArchiveEx(&open_data);
     if (!handle)
-        return fail(error, unrar_error_code(open_data.OpenResult, !archive->password.empty()),
+        return fail(error, rar_archive_error_code(archive, open_data.OpenResult),
                     static_cast<int32_t>(open_data.OpenResult), "Unable to open RAR archive");
 
     int32_t result = ERAR_SUCCESS;
@@ -801,7 +898,7 @@ int32_t list_rar(SAArchive *archive, SAError *error) {
     }
     RARCloseArchive(handle);
     if (result != ERAR_END_ARCHIVE)
-        return fail(error, unrar_error_code(result, !archive->password.empty()), result,
+        return fail(error, rar_archive_error_code(archive, result), result,
                     "Unable to read RAR directory");
     return validate_archive_limits(archive, error);
 }
@@ -1376,11 +1473,11 @@ int32_t skip_to_libarchive_entry(SAArchive *source, struct archive *reader,
     }
 }
 
-int32_t extract_one_libarchive(SAArchive *source, uint64_t entry_index,
-                               const fs::path &root,
-                               const SAExtractionOptions &options,
-                               SAProgressCallback progress, void *context,
-                               SAError *error) {
+int32_t extract_one_libarchive_with_progress(
+    SAArchive *source, uint64_t entry_index, const fs::path &root,
+    const SAExtractionOptions &options, SAProgressCallback progress,
+    void *context, uint64_t total_base, uint64_t total_size, SAError *error
+) {
     const Entry &entry = source->entries[entry_index];
     if (!require_libarchive_password(source, entry, error))
         return 0;
@@ -1412,7 +1509,7 @@ int32_t extract_one_libarchive(SAArchive *source, uint64_t entry_index,
     }
     int32_t success = stream_active_libarchive_entry(
         source, reader, entry_index, file_write_callback, &writer,
-        progress, context, 0, entry.uncompressed_size, error);
+        progress, context, total_base, total_size, error);
     if (std::fclose(writer.file) != 0 && success)
         success = fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
     archive_read_free(reader);
@@ -1426,6 +1523,16 @@ int32_t extract_one_libarchive(SAArchive *source, uint64_t entry_index,
         return 0;
     }
     return finish_extracted_file(temporary, output, entry, options, error);
+}
+
+int32_t extract_one_libarchive(SAArchive *source, uint64_t entry_index,
+                               const fs::path &root,
+                               const SAExtractionOptions &options,
+                               SAProgressCallback progress, void *context,
+                               SAError *error) {
+    return extract_one_libarchive_with_progress(
+        source, entry_index, root, options, progress, context,
+        0, source->entries[entry_index].uncompressed_size, error);
 }
 
 int32_t extract_libarchive(SAArchive *source, const fs::path &root,
@@ -1647,7 +1754,7 @@ int32_t open_zip_reader(SAArchive *archive, void **reader, SAError *error) {
     int32_t result = mz_zip_reader_open_file(*reader, archive->path.c_str());
     if (result != MZ_OK) {
         mz_zip_reader_delete(reader);
-        return fail(error, minizip_error_code(result, !archive->password.empty()), result,
+        return fail(error, zip_archive_error_code(archive, result), result,
                     "Unable to open ZIP archive");
     }
     return 1;
@@ -1659,6 +1766,152 @@ int32_t zip_goto_index(void *reader, uint64_t target, SAError *error) {
         result = mz_zip_reader_goto_next_entry(reader);
     if (result != MZ_OK)
         return fail(error, SA_ERROR_ENTRY_NOT_FOUND, result, "Archive entry was not found");
+    return 1;
+}
+
+struct Deflate64StreamContext {
+    SAArchive *archive = nullptr;
+    void *reader = nullptr;
+    const Entry *entry = nullptr;
+    uint64_t entry_index = 0;
+    SADataCallback data_callback = nullptr;
+    void *data_context = nullptr;
+    SAProgressCallback progress_callback = nullptr;
+    void *progress_context = nullptr;
+    uint64_t total_base = 0;
+    uint64_t total_size = 0;
+    uint64_t completed = 0;
+    uint32_t crc32 = 0;
+    int32_t input_error = MZ_OK;
+    bool callback_stopped = false;
+    bool resource_limit = false;
+    uint8_t input_buffer[128 * 1024]{};
+};
+
+unsigned deflate64_input_callback(void *opaque, z_const unsigned char **buffer) {
+    auto *context = static_cast<Deflate64StreamContext *>(opaque);
+    if (!context || context->archive->cancelled.load())
+        return 0;
+    int32_t read = mz_zip_reader_entry_read(
+        context->reader, context->input_buffer,
+        static_cast<int32_t>(sizeof(context->input_buffer)));
+    if (read < 0) {
+        context->input_error = read;
+        return 0;
+    }
+    *buffer = context->input_buffer;
+    return static_cast<unsigned>(read);
+}
+
+int deflate64_output_callback(void *opaque, unsigned char *buffer, unsigned length) {
+    auto *context = static_cast<Deflate64StreamContext *>(opaque);
+    if (!context || context->archive->cancelled.load())
+        return 1;
+
+    uint64_t amount = static_cast<uint64_t>(length);
+    uint64_t entry_limit = std::min(
+        context->archive->limits.maximum_entry_size,
+        context->archive->limits.maximum_total_size);
+    if (amount > entry_limit || context->completed > entry_limit - amount ||
+        context->total_base > context->archive->limits.maximum_total_size -
+            (context->completed + amount)) {
+        context->resource_limit = true;
+        return 1;
+    }
+    context->completed += amount;
+    if (context->entry->compressed_size > 0 &&
+        context->archive->limits.maximum_compression_ratio > 0 &&
+        static_cast<double>(context->completed) /
+                static_cast<double>(context->entry->compressed_size) >
+            context->archive->limits.maximum_compression_ratio) {
+        context->resource_limit = true;
+        return 1;
+    }
+
+    context->crc32 = static_cast<uint32_t>(::crc32(
+        context->crc32, reinterpret_cast<const Bytef *>(buffer), length));
+    if (context->data_callback &&
+        context->data_callback(context->data_context, buffer, length) == 0) {
+        context->callback_stopped = true;
+        context->archive->cancelled.store(true);
+        return 1;
+    }
+    SAProgress state{sizeof(SAProgress), context->entry_index,
+                     context->entry->path.c_str(), context->completed,
+                     context->entry->uncompressed_size,
+                     context->total_base + context->completed,
+                     context->total_size};
+    if (context->progress_callback &&
+        context->progress_callback(context->progress_context, &state) == 0) {
+        context->callback_stopped = true;
+        context->archive->cancelled.store(true);
+        return 1;
+    }
+    return 0;
+}
+
+int32_t stream_deflate64_entry(SAArchive *archive, void *reader,
+                               uint64_t entry_index,
+                               SADataCallback data_callback, void *data_context,
+                               SAProgressCallback progress_callback,
+                               void *progress_context, uint64_t total_base,
+                               uint64_t total_size, SAError *error) {
+    const Entry &entry = archive->entries[entry_index];
+    if (!require_zip_password(archive, entry, error))
+        return 0;
+
+    mz_zip_reader_set_raw(reader, 1);
+    int32_t open_result = mz_zip_reader_entry_open(reader);
+    if (open_result != MZ_OK) {
+        mz_zip_reader_set_raw(reader, 0);
+        return fail(error, zip_archive_error_code(archive, open_result),
+                    open_result, "Unable to open Deflate64 ZIP entry");
+    }
+
+    Deflate64StreamContext context{
+        archive, reader, &entry, entry_index, data_callback, data_context,
+        progress_callback, progress_context, total_base, total_size
+    };
+    z_stream stream{};
+    uint8_t window[64 * 1024]{};
+    int inflate_result = inflateBack9Init(&stream, window);
+    if (inflate_result == Z_OK) {
+        inflate_result = inflateBack9(
+            &stream, deflate64_input_callback, &context,
+            deflate64_output_callback, &context);
+    }
+    int end_result = stream.state ? inflateBack9End(&stream) : Z_OK;
+    int32_t close_result = mz_zip_reader_entry_close(reader);
+    mz_zip_reader_set_raw(reader, 0);
+
+    if (context.resource_limit)
+        return fail(error, SA_ERROR_RESOURCE_LIMIT, 0,
+                    "Deflate64 output exceeds the configured resource limits");
+    if (context.callback_stopped || archive->cancelled.load())
+        return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+    if (context.input_error != MZ_OK)
+        return fail(error,
+                    zip_archive_error_code(archive, context.input_error),
+                    context.input_error, "Unable to read Deflate64 ZIP data");
+    if (close_result != MZ_OK)
+        return fail(error,
+                    zip_archive_error_code(archive, close_result),
+                    close_result, "Unable to verify Deflate64 ZIP data");
+    if (inflate_result != Z_STREAM_END || end_result != Z_OK) {
+        SAErrorCode code = archive->uses_split_zip && inflate_result == Z_BUF_ERROR
+            ? SA_ERROR_MISSING_VOLUME
+            : (entry.encrypted && !archive->password.empty()
+                ? SA_ERROR_BAD_PASSWORD : SA_ERROR_CORRUPT_ARCHIVE);
+        return fail(error, code, inflate_result,
+                    "Unable to decompress Deflate64 ZIP data");
+    }
+    if (context.completed != entry.uncompressed_size ||
+        (entry.crc32 != 0 && context.crc32 != entry.crc32)) {
+        SAErrorCode code = entry.encrypted && !archive->password.empty()
+            ? SA_ERROR_BAD_PASSWORD : SA_ERROR_CORRUPT_ARCHIVE;
+        return fail(error, code, Z_DATA_ERROR,
+                    "Deflate64 ZIP size or checksum validation failed");
+    }
     return 1;
 }
 
@@ -1685,6 +1938,19 @@ int32_t extract_zip(SAArchive *archive, const fs::path &root,
             mz_zip_reader_delete(&reader);
             return fail(error, SA_ERROR_UNSAFE_LINK, 0, "Link extraction is disabled");
         }
+        if (archive->uses_hybrid_zip &&
+            !zip_method_uses_minizip(entry.compression_method)) {
+            if (!extract_one_libarchive_with_progress(
+                    archive, index, root, options, progress, context,
+                    total_completed, total_size, error)) {
+                mz_zip_reader_close(reader);
+                mz_zip_reader_delete(&reader);
+                return 0;
+            }
+            total_completed += entry.uncompressed_size;
+            result = mz_zip_reader_goto_next_entry(reader);
+            continue;
+        }
         fs::path output;
         bool skip = false;
         if (!prepare_output_path(root, entry, options.overwrite_policy, output, skip, error)) {
@@ -1705,41 +1971,60 @@ int32_t extract_zip(SAArchive *archive, const fs::path &root,
             mz_zip_reader_delete(&reader);
             return fail(error, SA_ERROR_IO, errno, "Unable to create extracted file");
         }
-        result = mz_zip_reader_entry_open(reader);
-        uint64_t entry_completed = 0;
-        uint8_t buffer[128 * 1024];
-        while (result == MZ_OK) {
-            int32_t read = mz_zip_reader_entry_read(reader, buffer, sizeof(buffer));
-            if (read < 0) {
-                result = read;
-                break;
+        bool extracted = true;
+        FileWriteContext writer{file};
+        if (entry.compression_method == kZipMethodDeflate64) {
+            extracted = stream_deflate64_entry(
+                archive, reader, index, file_write_callback, &writer,
+                progress, context, total_completed, total_size, error) != 0;
+            result = extracted ? MZ_OK : MZ_INTERNAL_ERROR;
+        } else {
+            result = mz_zip_reader_entry_open(reader);
+            uint64_t entry_completed = 0;
+            uint8_t buffer[128 * 1024];
+            while (result == MZ_OK) {
+                int32_t read = mz_zip_reader_entry_read(reader, buffer, sizeof(buffer));
+                if (read < 0) {
+                    result = read;
+                    break;
+                }
+                if (read == 0)
+                    break;
+                if (file_write_callback(&writer, buffer, static_cast<size_t>(read)) == 0) {
+                    result = MZ_WRITE_ERROR;
+                    break;
+                }
+                entry_completed += static_cast<uint64_t>(read);
+                SAProgress state{sizeof(SAProgress), index, entry.path.c_str(), entry_completed,
+                                 entry.uncompressed_size, total_completed + entry_completed, total_size};
+                if (archive->cancelled.load() || (progress && progress(context, &state) == 0)) {
+                    archive->cancelled.store(true);
+                    result = MZ_INTERNAL_ERROR;
+                    break;
+                }
             }
-            if (read == 0)
-                break;
-            if (std::fwrite(buffer, 1, static_cast<size_t>(read), file) != static_cast<size_t>(read)) {
-                result = MZ_WRITE_ERROR;
-                break;
-            }
-            entry_completed += static_cast<uint64_t>(read);
-            SAProgress state{sizeof(SAProgress), index, entry.path.c_str(), entry_completed,
-                             entry.uncompressed_size, total_completed + entry_completed, total_size};
-            if (archive->cancelled.load() || (progress && progress(context, &state) == 0)) {
-                archive->cancelled.store(true);
-                result = MZ_INTERNAL_ERROR;
-                break;
-            }
+            int32_t close_result = mz_zip_reader_entry_close(reader);
+            if (result == MZ_OK && close_result != MZ_OK)
+                result = close_result;
+            extracted = result == MZ_OK;
         }
-        int32_t close_result = mz_zip_reader_entry_close(reader);
-        std::fclose(file);
-        if (result == MZ_OK && close_result != MZ_OK)
-            result = close_result;
-        if (result != MZ_OK) {
+        if (std::fclose(file) != 0 && extracted) {
+            extracted = false;
+            fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
+        }
+        if (writer.failed) {
+            extracted = false;
+            fail(error, SA_ERROR_IO, writer.backend_error, "Unable to write extracted file");
+        }
+        if (!extracted) {
             std::remove(temporary.c_str());
             mz_zip_reader_close(reader);
             mz_zip_reader_delete(&reader);
+            if (error && error->code != SA_ERROR_NONE)
+                return 0;
             if (archive->cancelled.load())
                 return fail(error, SA_ERROR_CANCELLED, result, "Operation was cancelled");
-            return fail(error, minizip_error_code(result, !archive->password.empty()), result,
+            return fail(error, zip_archive_error_code(archive, result), result,
                         "Unable to extract ZIP entry");
         }
         std::error_code ec;
@@ -1760,7 +2045,7 @@ int32_t extract_zip(SAArchive *archive, const fs::path &root,
     mz_zip_reader_close(reader);
     mz_zip_reader_delete(&reader);
     if (result != MZ_END_OF_LIST && !archive->entries.empty())
-        return fail(error, minizip_error_code(result, !archive->password.empty()), result,
+        return fail(error, zip_archive_error_code(archive, result), result,
                     "Unable to continue reading ZIP archive");
     if (options.preserve_timestamps) {
         for (auto iterator = archive->entries.rbegin(); iterator != archive->entries.rend(); ++iterator) {
@@ -1781,7 +2066,7 @@ int32_t open_rar(SAArchive *archive, unsigned int mode, RarCallbackContext *call
     open_data.UserData = reinterpret_cast<LPARAM>(callback);
     handle = RAROpenArchiveEx(&open_data);
     if (!handle)
-        return fail(error, unrar_error_code(open_data.OpenResult, !archive->password.empty()),
+        return fail(error, rar_archive_error_code(archive, open_data.OpenResult),
                     static_cast<int32_t>(open_data.OpenResult), "Unable to open RAR archive");
     return 1;
 }
@@ -1860,7 +2145,7 @@ int32_t extract_rar(SAArchive *archive, const fs::path &root,
     if (archive->cancelled.load())
         return fail(error, SA_ERROR_CANCELLED, result, "Operation was cancelled");
     if (result != ERAR_SUCCESS)
-        return fail(error, unrar_error_code(result, !archive->password.empty()), result,
+        return fail(error, rar_archive_error_code(archive, result), result,
                     "Unable to extract RAR entry");
     if (options.preserve_timestamps) {
         for (auto iterator = archive->entries.rbegin(); iterator != archive->entries.rend(); ++iterator) {
@@ -1902,41 +2187,61 @@ int32_t extract_one_zip(SAArchive *archive, uint64_t index, const fs::path &root
         mz_zip_reader_delete(&reader);
         return fail(error, SA_ERROR_IO, errno, "Unable to create extracted file");
     }
-    int32_t result = mz_zip_reader_entry_open(reader);
-    uint64_t completed = 0;
-    uint8_t buffer[128 * 1024];
-    while (result == MZ_OK) {
-        int32_t read = mz_zip_reader_entry_read(reader, buffer, sizeof(buffer));
-        if (read < 0) {
-            result = read;
-            break;
+    int32_t result = MZ_OK;
+    bool extracted = true;
+    FileWriteContext writer{file};
+    if (entry.compression_method == kZipMethodDeflate64) {
+        extracted = stream_deflate64_entry(
+            archive, reader, index, file_write_callback, &writer,
+            progress, context, 0, entry.uncompressed_size, error) != 0;
+        result = extracted ? MZ_OK : MZ_INTERNAL_ERROR;
+    } else {
+        result = mz_zip_reader_entry_open(reader);
+        uint64_t completed = 0;
+        uint8_t buffer[128 * 1024];
+        while (result == MZ_OK) {
+            int32_t read = mz_zip_reader_entry_read(reader, buffer, sizeof(buffer));
+            if (read < 0) {
+                result = read;
+                break;
+            }
+            if (read == 0)
+                break;
+            if (file_write_callback(&writer, buffer, static_cast<size_t>(read)) == 0) {
+                result = MZ_WRITE_ERROR;
+                break;
+            }
+            completed += static_cast<uint64_t>(read);
+            SAProgress state{sizeof(SAProgress), index, entry.path.c_str(), completed,
+                             entry.uncompressed_size, completed, entry.uncompressed_size};
+            if (archive->cancelled.load() || (progress && progress(context, &state) == 0)) {
+                archive->cancelled.store(true);
+                result = MZ_INTERNAL_ERROR;
+                break;
+            }
         }
-        if (read == 0)
-            break;
-        if (std::fwrite(buffer, 1, static_cast<size_t>(read), file) != static_cast<size_t>(read)) {
-            result = MZ_WRITE_ERROR;
-            break;
-        }
-        completed += static_cast<uint64_t>(read);
-        SAProgress state{sizeof(SAProgress), index, entry.path.c_str(), completed,
-                         entry.uncompressed_size, completed, entry.uncompressed_size};
-        if (archive->cancelled.load() || (progress && progress(context, &state) == 0)) {
-            archive->cancelled.store(true);
-            result = MZ_INTERNAL_ERROR;
-            break;
-        }
+        int32_t close_result = mz_zip_reader_entry_close(reader);
+        if (result == MZ_OK && close_result != MZ_OK)
+            result = close_result;
+        extracted = result == MZ_OK;
     }
-    int32_t close_result = mz_zip_reader_entry_close(reader);
-    std::fclose(file);
+    if (std::fclose(file) != 0 && extracted) {
+        extracted = false;
+        fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
+    }
+    if (writer.failed) {
+        extracted = false;
+        fail(error, SA_ERROR_IO, writer.backend_error, "Unable to write extracted file");
+    }
     mz_zip_reader_close(reader);
     mz_zip_reader_delete(&reader);
-    if (result == MZ_OK && close_result != MZ_OK)
-        result = close_result;
-    if (result != MZ_OK) {
+    if (!extracted) {
         std::remove(temporary.c_str());
+        if (error && error->code != SA_ERROR_NONE)
+            return 0;
         if (archive->cancelled.load())
             return fail(error, SA_ERROR_CANCELLED, result, "Operation was cancelled");
-        return fail(error, minizip_error_code(result, !archive->password.empty()), result,
+        return fail(error, zip_archive_error_code(archive, result), result,
                     "Unable to extract ZIP entry");
     }
     std::error_code ec;
@@ -2006,7 +2311,7 @@ int32_t extract_one_rar(SAArchive *archive, uint64_t index, const fs::path &root
     if (result != ERAR_SUCCESS) {
         if (!temporary.empty())
             std::remove(temporary.c_str());
-        return fail(error, unrar_error_code(result, !archive->password.empty()), result,
+        return fail(error, rar_archive_error_code(archive, result), result,
                     "Unable to extract RAR entry");
     }
     const Entry &entry = archive->entries[index];
@@ -2427,6 +2732,10 @@ int32_t swiftarchive_archive_extract_entry(SAArchive *archive, uint64_t index,
     if (archive->uses_libarchive)
         return extract_one_libarchive(archive, index, root, effective,
                                       progress, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_ZIP && archive->uses_hybrid_zip &&
+        !zip_method_uses_minizip(archive->entries[index].compression_method))
+        return extract_one_libarchive(archive, index, root, effective,
+                                      progress, context, error);
     if (archive->format == SA_ARCHIVE_FORMAT_ZIP)
         return extract_one_zip(archive, index, root, effective, progress, context, error);
     if (archive->format == SA_ARCHIVE_FORMAT_RAR)
@@ -2453,6 +2762,9 @@ int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
     archive->cancelled.store(false);
     if (archive->uses_libarchive)
         return read_libarchive_entry(archive, index, callback, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_ZIP && archive->uses_hybrid_zip &&
+        !zip_method_uses_minizip(archive->entries[index].compression_method))
+        return read_libarchive_entry(archive, index, callback, context, error);
     if (archive->format == SA_ARCHIVE_FORMAT_ZIP) {
         void *reader = nullptr;
         if (!open_zip_reader(archive, &reader, error))
@@ -2461,6 +2773,15 @@ int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
             mz_zip_reader_close(reader);
             mz_zip_reader_delete(&reader);
             return 0;
+        }
+        if (archive->entries[index].compression_method == kZipMethodDeflate64) {
+            int32_t success = stream_deflate64_entry(
+                archive, reader, index, callback, context,
+                nullptr, nullptr, 0, archive->entries[index].uncompressed_size,
+                error);
+            mz_zip_reader_close(reader);
+            mz_zip_reader_delete(&reader);
+            return success;
         }
         int32_t result = mz_zip_reader_entry_open(reader);
         uint8_t buffer[128 * 1024];
@@ -2485,7 +2806,7 @@ int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
         if (result == MZ_OK && close_result != MZ_OK)
             result = close_result;
         if (result != MZ_OK)
-            return fail(error, minizip_error_code(result, !archive->password.empty()), result,
+            return fail(error, zip_archive_error_code(archive, result), result,
                         "Unable to read ZIP entry");
         return 1;
     }
@@ -2517,7 +2838,7 @@ int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
     if (archive->cancelled.load())
         return fail(error, SA_ERROR_CANCELLED, result, "Operation was cancelled");
     if (result != ERAR_SUCCESS)
-        return fail(error, unrar_error_code(result, !archive->password.empty()), result,
+        return fail(error, rar_archive_error_code(archive, result), result,
                     "Unable to read RAR entry");
     return 1;
 }

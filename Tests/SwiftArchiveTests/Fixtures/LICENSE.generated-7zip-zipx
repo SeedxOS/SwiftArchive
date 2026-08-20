@@ -1,0 +1,15 @@
+The 7z and ZIPX fixtures in this directory were generated for SwiftArchive's
+test suite from project-owned test payloads. They may be used, copied,
+modified, and redistributed without restriction.
+
+7z fixtures were generated with 7-Zip 26.02 using these representative modes:
+
+- Content encryption: -popen-sesame -mhe=off -ms=on
+- Header encryption: -popen-sesame -mhe=on -ms=on
+- Unicode password: -p密碼-🔐 -mhe=on
+- Split archives: -v64b
+
+ZIPX fixtures other than `zipx-zstd.zipx` and `zipx-xz.zipx` were generated
+with 7-Zip 26.02 by forcing the compression method named in each filename.
+The two exceptions are attributed to libarchive in `FIXTURES.md`, which also
+records representative commands and hashes.

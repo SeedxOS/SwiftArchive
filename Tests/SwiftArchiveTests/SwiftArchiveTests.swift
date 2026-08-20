@@ -255,6 +255,15 @@ final class SwiftArchiveTests: XCTestCase {
         let destination = root.appending(path: "one")
         try await archive.extract(archive.entries[0], to: destination)
         XCTAssertEqual(try Data(contentsOf: destination.appending(path: "random.bin")), bytes)
+
+        try FileManager.default.removeItem(at: root.appending(path: "split.z01"))
+        let incompleteArchive = try ArchiveReader(url: archiveURL)
+        do {
+            try await incompleteArchive.extract(to: root.appending(path: "missing-volume"))
+            XCTFail("Expected missing split ZIP volume to fail")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .missingVolume)
+        }
     }
 
     func testZIPCreationRejectsExistingOutputsAndCleansCancelledVolumes() async throws {
@@ -376,6 +385,14 @@ final class SwiftArchiveTests: XCTestCase {
         try await archive.extract(to: destination)
         XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appending(path: "vols/bigfile.txt").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: destination.appending(path: "vols/smallfile.txt").path))
+
+        let incompleteRoot = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: incompleteRoot) }
+        let incompleteURL = incompleteRoot.appending(path: "rar5-vols.part1.rar")
+        try FileManager.default.copyItem(at: fixture("rar5-vols.part1.rar"), to: incompleteURL)
+        XCTAssertThrowsError(try ArchiveReader(url: incompleteURL)) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .missingVolume)
+        }
     }
 
     func testRARLinksAreRejectedByDefault() throws {
@@ -588,9 +605,9 @@ final class SwiftArchiveTests: XCTestCase {
         )
     }
 
-    func testLibarchiveEncrypted7ZipPasswords() async throws {
+    func testEncrypted7ZipPasswords() async throws {
         XCTAssertThrowsError(try ArchiveReader(url: fixture("libarchive-encrypted.7z"))) { error in
-            XCTAssertEqual((error as? ArchiveError)?.code, .unsupportedFeature)
+            XCTAssertEqual((error as? ArchiveError)?.code, .passwordRequired)
         }
         XCTAssertThrowsError(
             try ArchiveReader(
@@ -598,15 +615,260 @@ final class SwiftArchiveTests: XCTestCase {
                 options: .init(password: "incorrect")
             )
         ) { error in
-            XCTAssertEqual((error as? ArchiveError)?.code, .unsupportedFeature)
+            XCTAssertEqual((error as? ArchiveError)?.code, .badPassword)
+        }
+        let archive = try ArchiveReader(
+            url: fixture("libarchive-encrypted.7z"),
+            options: .init(password: "open-sesame")
+        )
+        let entry = try XCTUnwrap(archive.entries.first { $0.kind == .file })
+        XCTAssertTrue(entry.isEncrypted)
+        let data = try await archive.data(for: entry)
+        XCTAssertEqual(data, Data("libarchive fixture payload\n".utf8))
+    }
+
+    func testSevenZipContentEncryptionDefersPasswordUntilReading() async throws {
+        let archiveURL = fixture("7z-encrypted-content.7z")
+        let passwordless = try ArchiveReader(url: archiveURL)
+        let entry = try XCTUnwrap(passwordless.entries.first { $0.kind == .file })
+        XCTAssertTrue(entry.isEncrypted)
+        do {
+            _ = try await passwordless.data(for: entry)
+            XCTFail("Expected passwordRequired")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .passwordRequired)
+        }
+
+        let wrong = try ArchiveReader(url: archiveURL, options: .init(password: "incorrect"))
+        do {
+            _ = try await wrong.data(for: try XCTUnwrap(wrong.entries.first { $0.kind == .file }))
+            XCTFail("Expected badPassword")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .badPassword)
+        }
+
+        let correct = try ArchiveReader(url: archiveURL, options: .init(password: "open-sesame"))
+        let decrypted = try await correct.data(for: try XCTUnwrap(correct.entries.first { $0.kind == .file }))
+        XCTAssertEqual(decrypted, Data("libarchive fixture payload\n".utf8))
+    }
+
+    func testSevenZipEncryptedHeader() async throws {
+        let headerArchive = try ArchiveReader(
+            url: fixture("7z-encrypted-header.7z"),
+            options: .init(password: "open-sesame")
+        )
+        let headerEntry = try XCTUnwrap(headerArchive.entries.first { $0.kind == .file })
+        let headerData = try await headerArchive.data(for: headerEntry)
+        XCTAssertEqual(
+            headerData,
+            Data("libarchive fixture payload\n".utf8)
+        )
+    }
+
+    func testSevenZipUnicodePassword() async throws {
+        let unicodeArchive = try ArchiveReader(
+            url: fixture("7z-encrypted-unicode-password.7z"),
+            options: .init(password: "密碼-🔐")
+        )
+        let unicodeEntry = try XCTUnwrap(unicodeArchive.entries.first { $0.kind == .file })
+        let unicodeData = try await unicodeArchive.data(for: unicodeEntry)
+        XCTAssertEqual(
+            unicodeData,
+            Data("libarchive fixture payload\n".utf8)
+        )
+    }
+
+    func testSevenZipEncryptedSolidArchive() async throws {
+        let solidArchive = try ArchiveReader(
+            url: fixture("7z-encrypted-solid.7z"),
+            options: .init(password: "open-sesame")
+        )
+        let solidFiles = solidArchive.entries.filter { $0.kind == .file }
+        XCTAssertEqual(solidFiles.count, 2)
+        XCTAssertTrue(solidFiles.allSatisfy(\.isSolid))
+        let first = try XCTUnwrap(solidFiles.first { $0.path == "solid/first.txt" })
+        let firstData = try await solidArchive.data(for: first)
+        XCTAssertEqual(
+            firstData,
+            try Data(contentsOf: fixture("zipx-payload.txt"))
+        )
+    }
+
+    func testSevenZipVolumesOpenFromAnyPartAndExplicitURLs() async throws {
+        let plainParts = (1...4).map {
+            fixture(String(format: "7z-split.7z.%03d", $0))
+        }
+        let fromLaterPart = try ArchiveReader(urls: [plainParts[2]])
+        XCTAssertEqual(fromLaterPart.url.lastPathComponent, "7z-split.7z.001")
+        let plainEntry = try XCTUnwrap(fromLaterPart.entries.first { $0.kind == .file })
+        let plainData = try await fromLaterPart.data(for: plainEntry)
+        XCTAssertEqual(
+            plainData,
+            Data("libarchive fixture payload\n".utf8)
+        )
+
+        let encryptedParts = (1...4).map {
+            fixture(String(format: "7z-encrypted-split.7z.%03d", $0))
+        }
+        XCTAssertThrowsError(try ArchiveReader(urls: encryptedParts)) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .passwordRequired)
         }
         XCTAssertThrowsError(
             try ArchiveReader(
-                url: fixture("libarchive-encrypted.7z"),
-                options: .init(password: "open-sesame")
+                urls: encryptedParts,
+                options: .init(password: "incorrect")
             )
         ) { error in
-            XCTAssertEqual((error as? ArchiveError)?.code, .unsupportedFeature)
+            XCTAssertEqual((error as? ArchiveError)?.code, .badPassword)
+        }
+        let encrypted = try ArchiveReader(
+            urls: Array(encryptedParts.reversed()),
+            options: .init(password: "open-sesame")
+        )
+        XCTAssertEqual(encrypted.url.lastPathComponent, "7z-encrypted-split.7z.001")
+        let encryptedEntry = try XCTUnwrap(encrypted.entries.first { $0.kind == .file })
+        XCTAssertTrue(encryptedEntry.isEncrypted)
+        let encryptedData = try await encrypted.data(for: encryptedEntry)
+        XCTAssertEqual(
+            encryptedData,
+            Data("libarchive fixture payload\n".utf8)
+        )
+    }
+
+    func testSevenZipMissingVolumeAndLinksAreRejected() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        for index in [1, 3, 4] {
+            let name = String(format: "7z-split.7z.%03d", index)
+            try FileManager.default.copyItem(at: fixture(name), to: root.appending(path: name))
+        }
+        XCTAssertThrowsError(
+            try ArchiveReader(url: root.appending(path: "7z-split.7z.001"))
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .missingVolume)
+        }
+
+        let missingFirst = root.appendingPathComponent("missing-first", isDirectory: true)
+        try FileManager.default.createDirectory(at: missingFirst, withIntermediateDirectories: true)
+        for index in [2, 3, 4] {
+            let name = String(format: "7z-split.7z.%03d", index)
+            try FileManager.default.copyItem(at: fixture(name), to: missingFirst.appending(path: name))
+        }
+        XCTAssertThrowsError(
+            try ArchiveReader(url: missingFirst.appending(path: "7z-split.7z.002"))
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .missingVolume)
+        }
+
+        let missingTail = root.appendingPathComponent("missing-tail", isDirectory: true)
+        try FileManager.default.createDirectory(at: missingTail, withIntermediateDirectories: true)
+        for index in [1, 2, 3] {
+            let name = String(format: "7z-split.7z.%03d", index)
+            try FileManager.default.copyItem(at: fixture(name), to: missingTail.appending(path: name))
+        }
+        XCTAssertThrowsError(
+            try ArchiveReader(url: missingTail.appending(path: "7z-split.7z.001"))
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .missingVolume)
+        }
+        XCTAssertThrowsError(try ArchiveReader(url: fixture("7z-symlink.7z"))) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsafeLink)
+        }
+    }
+
+    func testZIPXExtendedCompressionMethods() async throws {
+        let expected = try Data(contentsOf: fixture("zipx-payload.txt"))
+        for name in [
+            "zipx-deflate64.zipx",
+            "zipx-bzip2.zipx",
+            "zipx-lzma.zipx",
+            "zipx-ppmd.zipx",
+        ] {
+            let archive = try ArchiveReader(url: fixture(name))
+            XCTAssertEqual(archive.format, .zip, name)
+            let entry = try XCTUnwrap(archive.entries.first { $0.path == "zipx-payload.txt" }, name)
+            let data = try await archive.data(for: entry)
+            XCTAssertEqual(data, expected, name)
+
+            let destination = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: destination) }
+            try await archive.extract(to: destination)
+            XCTAssertEqual(
+                try Data(contentsOf: destination.appending(path: entry.path)),
+                expected,
+                name
+            )
+        }
+    }
+
+    func testZIPXMixedCompressionMethodsUsePerEntryBackends() async throws {
+        let expected = try Data(contentsOf: fixture("zipx-payload.txt"))
+        let archive = try ArchiveReader(url: fixture("zipx-mixed-methods.zipx"))
+        XCTAssertEqual(Set(archive.entries.map(\.path)), Set(["bzip2.txt", "deflate64.txt"]))
+
+        for entry in archive.entries where entry.kind == .file {
+            let data = try await archive.data(for: entry)
+            XCTAssertEqual(data, expected, entry.path)
+        }
+
+        let destination = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: destination) }
+        try await archive.extract(to: destination)
+        XCTAssertEqual(try Data(contentsOf: destination.appending(path: "bzip2.txt")), expected)
+        XCTAssertEqual(try Data(contentsOf: destination.appending(path: "deflate64.txt")), expected)
+
+        let singleDestination = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: singleDestination) }
+        let bzip2 = try XCTUnwrap(archive.entries.first { $0.path == "bzip2.txt" })
+        try await archive.extract(bzip2, to: singleDestination)
+        XCTAssertEqual(try Data(contentsOf: singleDestination.appending(path: "bzip2.txt")), expected)
+    }
+
+    func testZIPXDeflate64AESPasswordsAndCancellation() async throws {
+        let archiveURL = fixture("zipx-deflate64-aes.zipx")
+        let passwordless = try ArchiveReader(url: archiveURL)
+        let passwordlessEntry = try XCTUnwrap(passwordless.entries.first { $0.kind == .file })
+        XCTAssertTrue(passwordlessEntry.isEncrypted)
+        do {
+            _ = try await passwordless.data(for: passwordlessEntry)
+            XCTFail("Expected passwordRequired")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .passwordRequired)
+        }
+
+        let wrong = try ArchiveReader(url: archiveURL, options: .init(password: "incorrect"))
+        do {
+            _ = try await wrong.data(for: try XCTUnwrap(wrong.entries.first { $0.kind == .file }))
+            XCTFail("Expected badPassword")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .badPassword)
+        }
+
+        let correct = try ArchiveReader(url: archiveURL, options: .init(password: "open-sesame"))
+        let entry = try XCTUnwrap(correct.entries.first { $0.kind == .file })
+        let data = try await correct.data(for: entry)
+        XCTAssertEqual(
+            data,
+            try Data(contentsOf: fixture("zipx-payload.txt"))
+        )
+        do {
+            try await correct.read(entry) { _ in false }
+            XCTFail("Expected cancelled")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .cancelled)
+        }
+    }
+
+    func testZIPXZstandardAndXZMethods() async throws {
+        for (name, path, expectedCRC) in [
+            ("zipx-zstd.zipx", "vimrc", UInt32(0xBA8E3BAA)),
+            ("zipx-xz.zipx", "bash.bashrc", UInt32(0xF751B8C9)),
+        ] {
+            let archive = try ArchiveReader(url: fixture(name))
+            XCTAssertEqual(archive.format, .zip, name)
+            let entry = try XCTUnwrap(archive.entries.first { $0.path == path }, name)
+            let data = try await archive.data(for: entry)
+            XCTAssertEqual(crc32(data), expectedCRC, name)
         }
     }
 

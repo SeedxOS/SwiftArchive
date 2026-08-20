@@ -1,0 +1,18 @@
+SwiftArchive ZIPX compatibility fixture
+
+This payload verifies streaming reads and extraction through extended ZIP compression methods.
+It deliberately contains repeated text so archive tools choose the requested codec instead of storing the file.
+
+Deflate64, BZip2, LZMA, PPMd, XZ, and Zstandard are common extended ZIP methods handled by the bundled backends when the archive advertises them correctly.
+中文文件内容用于验证 UTF-8 文本在不同 ZIPX 压缩算法下保持完整。
+
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
+SwiftArchive ZIPX compatibility fixture
