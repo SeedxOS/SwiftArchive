@@ -102,6 +102,22 @@ public final class ArchiveReader: @unchecked Sendable {
                 switch requestedFormat {
                 case .zip: nativeFormat = SA_ARCHIVE_FORMAT_ZIP
                 case .rar: nativeFormat = SA_ARCHIVE_FORMAT_RAR
+                case .tar: nativeFormat = SA_ARCHIVE_FORMAT_TAR
+                case .gzip: nativeFormat = SA_ARCHIVE_FORMAT_GZIP
+                case .sevenZip: nativeFormat = SA_ARCHIVE_FORMAT_7ZIP
+                case .bzip2: nativeFormat = SA_ARCHIVE_FORMAT_BZIP2
+                case .xz: nativeFormat = SA_ARCHIVE_FORMAT_XZ
+                case .lzma: nativeFormat = SA_ARCHIVE_FORMAT_LZMA
+                case .lzip: nativeFormat = SA_ARCHIVE_FORMAT_LZIP
+                case .compress: nativeFormat = SA_ARCHIVE_FORMAT_COMPRESS
+                case .zstandard: nativeFormat = SA_ARCHIVE_FORMAT_ZSTD
+                case .lz4: nativeFormat = SA_ARCHIVE_FORMAT_LZ4
+                case .cab: nativeFormat = SA_ARCHIVE_FORMAT_CAB
+                case .cpio: nativeFormat = SA_ARCHIVE_FORMAT_CPIO
+                case .iso9660: nativeFormat = SA_ARCHIVE_FORMAT_ISO9660
+                case .lha: nativeFormat = SA_ARCHIVE_FORMAT_LHA
+                case .ar: nativeFormat = SA_ARCHIVE_FORMAT_AR
+                case .warc: nativeFormat = SA_ARCHIVE_FORMAT_WARC
                 case nil: nativeFormat = SA_ARCHIVE_FORMAT_AUTO
                 }
                 return swiftarchive_archive_open(path, nativeFormat, &nativeOptions, &error)
@@ -116,6 +132,38 @@ public final class ArchiveReader: @unchecked Sendable {
             format = .zip
         case SA_ARCHIVE_FORMAT_RAR:
             format = .rar
+        case SA_ARCHIVE_FORMAT_TAR:
+            format = .tar
+        case SA_ARCHIVE_FORMAT_GZIP:
+            format = .gzip
+        case SA_ARCHIVE_FORMAT_7ZIP:
+            format = .sevenZip
+        case SA_ARCHIVE_FORMAT_BZIP2:
+            format = .bzip2
+        case SA_ARCHIVE_FORMAT_XZ:
+            format = .xz
+        case SA_ARCHIVE_FORMAT_LZMA:
+            format = .lzma
+        case SA_ARCHIVE_FORMAT_LZIP:
+            format = .lzip
+        case SA_ARCHIVE_FORMAT_COMPRESS:
+            format = .compress
+        case SA_ARCHIVE_FORMAT_ZSTD:
+            format = .zstandard
+        case SA_ARCHIVE_FORMAT_LZ4:
+            format = .lz4
+        case SA_ARCHIVE_FORMAT_CAB:
+            format = .cab
+        case SA_ARCHIVE_FORMAT_CPIO:
+            format = .cpio
+        case SA_ARCHIVE_FORMAT_ISO9660:
+            format = .iso9660
+        case SA_ARCHIVE_FORMAT_LHA:
+            format = .lha
+        case SA_ARCHIVE_FORMAT_AR:
+            format = .ar
+        case SA_ARCHIVE_FORMAT_WARC:
+            format = .warc
         default:
             swiftarchive_archive_close(opened)
             throw ArchiveError(code: .unsupportedFormat, backendCode: 0, message: "Unsupported archive format")

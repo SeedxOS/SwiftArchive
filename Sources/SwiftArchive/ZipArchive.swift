@@ -39,17 +39,23 @@ public enum ZipArchive {
         nativeOptions.include_parent_directory = options.includeParentDirectory ? 1 : 0
         nativeOptions.volume_size = options.volumeSize
 
-        let sourceStorage = inputs.map { strdup($0.sourceURL.path)! }
+        let sourceStorage: [UnsafeMutablePointer<CChar>?] = inputs.map {
+            strdup($0.sourceURL.path)
+        }
         let archiveStorage = inputs.map { input -> UnsafeMutablePointer<CChar>? in
             input.pathInArchive.map { strdup($0) }
         }
         defer {
-            sourceStorage.forEach { pointer in free(pointer) }
+            sourceStorage.forEach { pointer in
+                if let pointer { free(pointer) }
+            }
             archiveStorage.forEach { pointer in
                 if let pointer { free(pointer) }
             }
         }
-        let sourcePointers = sourceStorage.map { UnsafePointer($0) as UnsafePointer<CChar>? }
+        let sourcePointers: [UnsafePointer<CChar>?] = sourceStorage.map { pointer in
+            pointer.map { UnsafePointer($0) }
+        }
         let archivePointers: [UnsafePointer<CChar>?] = archiveStorage.map { pointer in
             pointer.map { UnsafePointer($0) }
         }

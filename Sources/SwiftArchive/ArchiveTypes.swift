@@ -3,6 +3,22 @@ import Foundation
 public enum ArchiveFormat: Sendable, Equatable {
     case zip
     case rar
+    case tar
+    case gzip
+    case sevenZip
+    case bzip2
+    case xz
+    case lzma
+    case lzip
+    case compress
+    case zstandard
+    case lz4
+    case cab
+    case cpio
+    case iso9660
+    case lha
+    case ar
+    case warc
 }
 
 public enum ArchiveFilenameEncoding: Int32, Sendable, CaseIterable {

@@ -1,7 +1,7 @@
 # SwiftArchive
 
-SwiftArchive is an independent Swift package for working with ZIP and RAR
-archives through a unified API. Its Swift interface and other language bindings
+SwiftArchive is an independent Swift package for working with common archive
+and compression formats through a unified API. Its Swift interface and other language bindings
 share the same C/C++ core. It does not depend on command-line tools, private
 platform archive APIs, or a specific host application.
 
@@ -11,10 +11,22 @@ platform archive APIs, or a specific host application.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | ZIP | Yes | Yes | Yes | Yes | ZipCrypto / WinZip AES | Yes | N/A |
 | RAR | Yes | Yes | Yes | No | RAR 3/5 | Yes | Yes |
+| TAR | Yes | Yes | Yes | No | N/A | No | N/A |
+| GZIP | Yes (single stream) | Yes | Yes | No | N/A | No | N/A |
+| 7z | Yes | Yes | Yes | No | Not supported by libarchive | No | Yes |
+| BZIP2 / XZ / LZMA / LZIP / Zstandard / LZ4 / Unix Compress | Yes (single stream) | Yes | Yes | No | N/A | No | N/A |
+| CAB / CPIO / ISO 9660 / LHA-LZH / AR / WARC | Yes | Yes | Yes | No | N/A | No | Format dependent |
 
 ZIP filenames follow the UTF-8 flag when present. Legacy archives support
 automatic encoding detection and explicit CP437, CP932, CP936, and CP950
 overrides. Newly created ZIP archives always use UTF-8 filenames.
+TAR supports POSIX ustar headers, PAX path/size/time metadata, and GNU long
+names. GZIP exposes its decompressed stream as one regular-file entry and uses
+the original filename from the header when it is safe and valid UTF-8.
+Compressed TAR streams are detected by content and exposed as TAR archives.
+ZIPX files that use methods supported by libarchive can fall back to the
+libarchive backend. Encrypted 7z archives are reported as an unsupported
+feature because libarchive 3.8.9 does not implement 7z encryption.
 
 SwiftArchive also provides:
 
@@ -138,6 +150,9 @@ SwiftArchive contains separately licensed third-party code:
 - The ZIP backend is minizip-ng, licensed under the zlib license.
 - The RAR backend is the official UnRAR source, distributed under its dedicated
   freeware source license.
+- Additional read/extract support uses libarchive 3.8.9. Its optional filters
+  are built from vendored XZ Utils/liblzma 5.8.3, bzip2 1.0.8, Zstandard 1.5.7,
+  and LZ4 1.10.0 source.
 - Selected RAR test fixtures come from rarfile and are licensed under the ISC
   license.
 
@@ -156,14 +171,17 @@ Run the test suite on macOS:
 swift test
 ```
 
-Build for an arm64 iOS Simulator before release:
+Build for a generic iOS device before release:
 
 ```sh
 xcodebuild -scheme SwiftArchive \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+  -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
 ```
 
 The test suite covers UTF-8 and CP936 filenames, ZipCrypto, WinZip AES, wrong
 passwords, path traversal, resource limits, overwrite behavior, cancellation,
 multi-volume ZIP, password-protected RAR, encrypted RAR headers, solid archives,
-Unicode paths, and multi-volume RAR.
+Unicode paths, multi-volume RAR, TAR listing/extraction/link rejection, and GZIP
+streaming/footer validation. It also covers 7z and compressed TAR streams using
+XZ, bzip2, Zstandard, and LZ4, including Unicode paths, cancellation, unsafe
+paths, and resource limits.

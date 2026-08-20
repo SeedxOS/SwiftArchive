@@ -15,19 +15,25 @@
 #include "SwiftArchiveCore.h"
 
 #include "CUnRAR.h"
+#include <archive.h>
+#include <archive_entry.h>
 #include "mz.h"
 #include "mz_os.h"
 #include "mz_strm.h"
 #include "mz_zip.h"
 #include "mz_zip_rw.h"
+#include <zlib.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <new>
 #include <set>
 #include <string>
@@ -52,6 +58,7 @@ struct Entry {
     bool solid = false;
     bool split_before = false;
     bool split_after = false;
+    uint64_t data_offset = 0;
 };
 
 struct RarCallbackContext {
@@ -228,7 +235,7 @@ std::string decode_zip_name(const mz_zip_file *info, SAFilenameEncoding encoding
 }
 
 std::string normalized_entry_path(const std::string &input) {
-    if (input.empty() || input.find('\0') != std::string::npos)
+    if (input.empty() || input.find('\0') != std::string::npos || !valid_utf8(input))
         return {};
     std::string value = input;
     std::replace(value.begin(), value.end(), '\\', '/');
@@ -437,6 +444,7 @@ struct SAArchive {
     SAOpenOptions limits{};
     std::vector<Entry> entries;
     std::atomic<bool> cancelled{false};
+    bool uses_libarchive = false;
 };
 
 namespace {
@@ -470,6 +478,227 @@ int32_t validate_archive_limits(SAArchive *archive, SAError *error) {
         if (total > archive->limits.maximum_total_size)
             return fail(error, SA_ERROR_RESOURCE_LIMIT, 0, "Archive exceeds the configured total size limit");
     }
+    return 1;
+}
+
+std::string lowercase_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return value;
+}
+
+SAErrorCode libarchive_error_code(struct archive *reader, bool has_password) {
+    const char *archive_message = archive_error_string(reader);
+    std::string message = lowercase_ascii(archive_message ? archive_message : "");
+    if (message.find("unsupported") != std::string::npos ||
+        message.find("not supported") != std::string::npos)
+        return SA_ERROR_UNSUPPORTED_FEATURE;
+    if (message.find("passphrase") != std::string::npos ||
+        message.find("password") != std::string::npos) {
+        if (!has_password || message.find("required") != std::string::npos ||
+            message.find("without") != std::string::npos)
+            return SA_ERROR_PASSWORD_REQUIRED;
+        return SA_ERROR_BAD_PASSWORD;
+    }
+    if (message.find("encrypted") != std::string::npos)
+        return has_password ? SA_ERROR_BAD_PASSWORD : SA_ERROR_PASSWORD_REQUIRED;
+    if (message.find("memory") != std::string::npos || archive_errno(reader) == ENOMEM)
+        return SA_ERROR_RESOURCE_LIMIT;
+    if (message.find("format") != std::string::npos ||
+        message.find("corrupt") != std::string::npos ||
+        message.find("checksum") != std::string::npos ||
+        message.find("truncated") != std::string::npos)
+        return SA_ERROR_CORRUPT_ARCHIVE;
+    return SA_ERROR_IO;
+}
+
+int32_t fail_libarchive(SAError *error, struct archive *reader,
+                        bool has_password, const char *fallback) {
+    const char *detail = archive_error_string(reader);
+    return fail(error, libarchive_error_code(reader, has_password),
+                archive_errno(reader), detail && detail[0] ? detail : fallback);
+}
+
+bool register_libarchive_readers(struct archive *reader) {
+    const int results[] = {
+        archive_read_support_filter_none(reader),
+        archive_read_support_filter_gzip(reader),
+        archive_read_support_filter_bzip2(reader),
+        archive_read_support_filter_compress(reader),
+        archive_read_support_filter_xz(reader),
+        archive_read_support_filter_lzma(reader),
+        archive_read_support_filter_lzip(reader),
+        archive_read_support_filter_lz4(reader),
+        archive_read_support_filter_zstd(reader),
+        archive_read_support_filter_rpm(reader),
+        archive_read_support_format_7zip(reader),
+        archive_read_support_format_ar(reader),
+        archive_read_support_format_cab(reader),
+        archive_read_support_format_cpio(reader),
+        archive_read_support_format_empty(reader),
+        archive_read_support_format_iso9660(reader),
+        archive_read_support_format_lha(reader),
+        archive_read_support_format_raw(reader),
+        archive_read_support_format_tar(reader),
+        archive_read_support_format_warc(reader),
+        archive_read_support_format_zip(reader),
+    };
+    return std::all_of(std::begin(results), std::end(results), [](int result) {
+        return result >= ARCHIVE_WARN;
+    });
+}
+
+struct archive *open_libarchive_reader(SAArchive *source, SAError *error) {
+    struct archive *reader = archive_read_new();
+    if (!reader) {
+        fail(error, SA_ERROR_INTERNAL, ENOMEM, "Unable to allocate libarchive reader");
+        return nullptr;
+    }
+    if (!register_libarchive_readers(reader)) {
+        fail_libarchive(error, reader, !source->password.empty(),
+                        "Unable to configure libarchive reader");
+        archive_read_free(reader);
+        return nullptr;
+    }
+    if (!source->password.empty() &&
+        archive_read_add_passphrase(reader, source->password.c_str()) < ARCHIVE_OK) {
+        fail_libarchive(error, reader, true, "Unable to configure archive password");
+        archive_read_free(reader);
+        return nullptr;
+    }
+    int result = archive_read_open_filename(reader, source->path.c_str(), 128 * 1024);
+    if (result < ARCHIVE_OK) {
+        fail_libarchive(error, reader, !source->password.empty(),
+                        "Unable to open archive with libarchive");
+        archive_read_free(reader);
+        return nullptr;
+    }
+    return reader;
+}
+
+SAArchiveFormat filter_archive_format(struct archive *reader) {
+    for (int index = 0; index < archive_filter_count(reader); ++index) {
+        switch (archive_filter_code(reader, index)) {
+        case ARCHIVE_FILTER_GZIP: return SA_ARCHIVE_FORMAT_GZIP;
+        case ARCHIVE_FILTER_BZIP2: return SA_ARCHIVE_FORMAT_BZIP2;
+        case ARCHIVE_FILTER_LZMA: return SA_ARCHIVE_FORMAT_LZMA;
+        case ARCHIVE_FILTER_XZ: return SA_ARCHIVE_FORMAT_XZ;
+        case ARCHIVE_FILTER_LZIP: return SA_ARCHIVE_FORMAT_LZIP;
+        case ARCHIVE_FILTER_COMPRESS: return SA_ARCHIVE_FORMAT_COMPRESS;
+        case ARCHIVE_FILTER_ZSTD: return SA_ARCHIVE_FORMAT_ZSTD;
+        case ARCHIVE_FILTER_LZ4: return SA_ARCHIVE_FORMAT_LZ4;
+        default: break;
+        }
+    }
+    return SA_ARCHIVE_FORMAT_AUTO;
+}
+
+SAArchiveFormat detected_libarchive_format(struct archive *reader) {
+    switch (archive_format(reader) & ARCHIVE_FORMAT_BASE_MASK) {
+    case ARCHIVE_FORMAT_7ZIP: return SA_ARCHIVE_FORMAT_7ZIP;
+    case ARCHIVE_FORMAT_AR: return SA_ARCHIVE_FORMAT_AR;
+    case ARCHIVE_FORMAT_CAB: return SA_ARCHIVE_FORMAT_CAB;
+    case ARCHIVE_FORMAT_CPIO: return SA_ARCHIVE_FORMAT_CPIO;
+    case ARCHIVE_FORMAT_ISO9660: return SA_ARCHIVE_FORMAT_ISO9660;
+    case ARCHIVE_FORMAT_LHA: return SA_ARCHIVE_FORMAT_LHA;
+    case ARCHIVE_FORMAT_TAR: return SA_ARCHIVE_FORMAT_TAR;
+    case ARCHIVE_FORMAT_WARC: return SA_ARCHIVE_FORMAT_WARC;
+    case ARCHIVE_FORMAT_ZIP: return SA_ARCHIVE_FORMAT_ZIP;
+    case ARCHIVE_FORMAT_RAW: return filter_archive_format(reader);
+    default: return SA_ARCHIVE_FORMAT_AUTO;
+    }
+}
+
+std::string raw_archive_entry_name(const SAArchive *source) {
+    fs::path filename = fs::path(source->path).filename();
+    fs::path stem = filename.stem();
+    std::string result = stem.string();
+    if (result.empty() || result == ".")
+        result = "Unpacked";
+    return result;
+}
+
+int32_t list_libarchive(SAArchive *source, SAError *error) {
+    struct archive *reader = open_libarchive_reader(source, error);
+    if (!reader)
+        return 0;
+
+    int result = ARCHIVE_OK;
+    uint64_t native_index = 0;
+    struct archive_entry *header = nullptr;
+    while ((result = archive_read_next_header(reader, &header)) == ARCHIVE_OK) {
+        SAArchiveFormat detected = detected_libarchive_format(reader);
+        if (detected == SA_ARCHIVE_FORMAT_AUTO) {
+            archive_read_free(reader);
+            return fail(error, SA_ERROR_UNSUPPORTED_FORMAT, 0,
+                        "Archive format is not supported");
+        }
+        source->format = detected;
+
+        const char *pathname = archive_entry_pathname_utf8(header);
+        if (!pathname)
+            pathname = archive_entry_pathname(header);
+        std::string path = pathname ? pathname : "";
+        if ((archive_format(reader) & ARCHIVE_FORMAT_BASE_MASK) == ARCHIVE_FORMAT_RAW)
+            path = raw_archive_entry_name(source);
+
+        mode_t file_type = archive_entry_filetype(header);
+        if ((path == "." || path == "./") && file_type == AE_IFDIR) {
+            result = archive_read_data_skip(reader);
+            if (result < ARCHIVE_OK)
+                break;
+            ++native_index;
+            continue;
+        }
+
+        Entry entry;
+        entry.path = std::move(path);
+        entry.data_offset = native_index;
+        if (archive_entry_hardlink(header))
+            entry.kind = SA_ENTRY_HARD_LINK;
+        else if (archive_entry_symlink(header) || file_type == AE_IFLNK)
+            entry.kind = SA_ENTRY_SYMBOLIC_LINK;
+        else if (file_type == AE_IFDIR)
+            entry.kind = SA_ENTRY_DIRECTORY;
+        else if (file_type != 0 && file_type != AE_IFREG)
+            entry.kind = SA_ENTRY_OTHER_LINK;
+
+        if (archive_entry_size_is_set(header) && archive_entry_size(header) >= 0)
+            entry.uncompressed_size = static_cast<uint64_t>(archive_entry_size(header));
+        if (archive_entry_mtime_is_set(header))
+            entry.modification_time = static_cast<int64_t>(archive_entry_mtime(header));
+        entry.encrypted = archive_entry_is_encrypted(header) != 0;
+        source->entries.push_back(std::move(entry));
+
+        result = archive_read_data_skip(reader);
+        if (result < ARCHIVE_OK)
+            break;
+        ++native_index;
+    }
+
+    if (source->format == SA_ARCHIVE_FORMAT_AUTO)
+        source->format = detected_libarchive_format(reader);
+    if (result != ARCHIVE_EOF) {
+        int32_t failure = fail_libarchive(error, reader, !source->password.empty(),
+                                          "Unable to read archive directory");
+        archive_read_free(reader);
+        return failure;
+    }
+    archive_read_free(reader);
+    if (source->format == SA_ARCHIVE_FORMAT_AUTO)
+        return fail(error, SA_ERROR_UNSUPPORTED_FORMAT, 0,
+                    "Archive format is not supported");
+    source->uses_libarchive = true;
+    return validate_archive_limits(source, error);
+}
+
+int32_t require_libarchive_password(SAArchive *source, const Entry &entry,
+                                    SAError *error) {
+    if (source->uses_libarchive && entry.kind == SA_ENTRY_FILE &&
+        entry.encrypted && source->password.empty())
+        return fail(error, SA_ERROR_PASSWORD_REQUIRED, 0,
+                    "A password is required to read this archive entry");
     return 1;
 }
 
@@ -575,6 +804,839 @@ int32_t list_rar(SAArchive *archive, SAError *error) {
         return fail(error, unrar_error_code(result, !archive->password.empty()), result,
                     "Unable to read RAR directory");
     return validate_archive_limits(archive, error);
+}
+
+bool block_is_zero(const uint8_t *block, size_t length) {
+    for (size_t index = 0; index < length; ++index) {
+        if (block[index] != 0)
+            return false;
+    }
+    return true;
+}
+
+std::string tar_string(const uint8_t *value, size_t length) {
+    size_t end = 0;
+    while (end < length && value[end] != 0)
+        ++end;
+    while (end > 0 && value[end - 1] == ' ')
+        --end;
+    return std::string(reinterpret_cast<const char *>(value), end);
+}
+
+bool parse_tar_number(const uint8_t *value, size_t length, uint64_t &result) {
+    if (length == 0)
+        return false;
+    if ((value[0] & 0x80) != 0) {
+        result = value[0] & 0x7f;
+        for (size_t index = 1; index < length; ++index) {
+            if (result > (std::numeric_limits<uint64_t>::max() >> 8))
+                return false;
+            result = (result << 8) | value[index];
+        }
+        return true;
+    }
+
+    result = 0;
+    size_t index = 0;
+    while (index < length && (value[index] == 0 || value[index] == ' '))
+        ++index;
+    bool found_digit = false;
+    for (; index < length && value[index] >= '0' && value[index] <= '7'; ++index) {
+        found_digit = true;
+        if (result > (std::numeric_limits<uint64_t>::max() >> 3))
+            return false;
+        result = (result << 3) | static_cast<uint64_t>(value[index] - '0');
+    }
+    return found_digit || result == 0;
+}
+
+bool valid_tar_checksum(const uint8_t *header) {
+    uint64_t expected = 0;
+    if (!parse_tar_number(header + 148, 8, expected))
+        return false;
+    uint64_t checksum = 0;
+    for (size_t index = 0; index < 512; ++index)
+        checksum += index >= 148 && index < 156 ? static_cast<uint8_t>(' ') : header[index];
+    return checksum == expected;
+}
+
+bool read_tar_payload(std::ifstream &stream, uint64_t size, std::string &value) {
+    constexpr uint64_t maximum_metadata_size = 16ULL * 1024 * 1024;
+    if (size > maximum_metadata_size || size > static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+        return false;
+    value.resize(static_cast<size_t>(size));
+    if (size > 0)
+        stream.read(value.data(), static_cast<std::streamsize>(size));
+    return stream.good() || (stream.eof() && stream.gcount() == static_cast<std::streamsize>(size));
+}
+
+void parse_pax_records(const std::string &payload, std::string &path,
+                       uint64_t &size, bool &has_size, int64_t &modification_time,
+                       bool &has_modification_time) {
+    size_t offset = 0;
+    while (offset < payload.size()) {
+        size_t space = payload.find(' ', offset);
+        if (space == std::string::npos)
+            break;
+        uint64_t record_length = 0;
+        try {
+            record_length = std::stoull(payload.substr(offset, space - offset));
+        } catch (...) {
+            break;
+        }
+        if (record_length == 0 || record_length > payload.size() - offset)
+            break;
+        size_t record_end = offset + static_cast<size_t>(record_length);
+        size_t equals = payload.find('=', space + 1);
+        if (equals != std::string::npos && equals < record_end) {
+            size_t value_end = record_end;
+            if (value_end > equals + 1 && payload[value_end - 1] == '\n')
+                --value_end;
+            std::string key = payload.substr(space + 1, equals - space - 1);
+            std::string field = payload.substr(equals + 1, value_end - equals - 1);
+            try {
+                if (key == "path") {
+                    path = field;
+                } else if (key == "size") {
+                    size = std::stoull(field);
+                    has_size = true;
+                } else if (key == "mtime") {
+                    modification_time = static_cast<int64_t>(std::stod(field));
+                    has_modification_time = true;
+                }
+            } catch (...) {
+                // Ignore malformed optional PAX values; the base header remains authoritative.
+            }
+        }
+        offset = record_end;
+    }
+}
+
+int32_t list_tar(SAArchive *archive, SAError *error) {
+    std::ifstream stream(archive->path, std::ios::binary);
+    if (!stream)
+        return fail(error, SA_ERROR_OPEN_FAILED, errno, "Unable to open TAR archive");
+    std::error_code file_error;
+    uint64_t file_size = fs::file_size(archive->path, file_error);
+    if (file_error)
+        return fail(error, SA_ERROR_IO, file_error.value(), "Unable to inspect TAR archive");
+
+    uint64_t offset = 0;
+    unsigned int zero_blocks = 0;
+    std::string pending_path;
+    uint64_t pending_size = 0;
+    bool has_pending_size = false;
+    int64_t pending_modification_time = 0;
+    bool has_pending_modification_time = false;
+    bool saw_end_marker = false;
+    while (offset + 512 <= file_size) {
+        uint8_t header[512]{};
+        stream.seekg(static_cast<std::streamoff>(offset));
+        stream.read(reinterpret_cast<char *>(header), sizeof(header));
+        if (stream.gcount() != sizeof(header))
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR header is truncated");
+        if (block_is_zero(header, sizeof(header))) {
+            saw_end_marker = true;
+            if (++zero_blocks >= 2 || offset + 512 == file_size)
+                break;
+            offset += 512;
+            continue;
+        }
+        zero_blocks = 0;
+        if (!valid_tar_checksum(header))
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR header checksum is invalid");
+
+        uint64_t header_size = 0;
+        uint64_t header_time = 0;
+        if (!parse_tar_number(header + 124, 12, header_size) ||
+            !parse_tar_number(header + 136, 12, header_time))
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR header contains an invalid number");
+        uint64_t padded_size = (header_size + 511) & ~uint64_t(511);
+        if (padded_size < header_size || offset + 512 > file_size ||
+            padded_size > file_size - offset - 512)
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR entry data is truncated");
+
+        char type = static_cast<char>(header[156]);
+        if (type == 'L' || type == 'x' || type == 'g') {
+            std::string payload;
+            stream.seekg(static_cast<std::streamoff>(offset + 512));
+            if (!read_tar_payload(stream, header_size, payload))
+                return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR metadata is invalid");
+            if (type == 'L') {
+                while (!payload.empty() && (payload.back() == 0 || payload.back() == '\n'))
+                    payload.pop_back();
+                pending_path = std::move(payload);
+            } else if (type == 'x') {
+                parse_pax_records(payload, pending_path, pending_size, has_pending_size,
+                                  pending_modification_time, has_pending_modification_time);
+            }
+            offset += 512 + padded_size;
+            continue;
+        }
+
+        std::string name = tar_string(header, 100);
+        std::string prefix = tar_string(header + 345, 155);
+        std::string path = pending_path.empty() ? (prefix.empty() ? name : prefix + "/" + name)
+                                                : pending_path;
+        uint64_t size = has_pending_size ? pending_size : header_size;
+        int64_t modification_time = has_pending_modification_time
+                                        ? pending_modification_time
+                                        : static_cast<int64_t>(header_time);
+        pending_path.clear();
+        has_pending_size = false;
+        has_pending_modification_time = false;
+
+        Entry entry;
+        entry.path = std::move(path);
+        entry.compressed_size = size;
+        entry.uncompressed_size = size;
+        entry.modification_time = modification_time;
+        entry.data_offset = offset + 512;
+        switch (type) {
+        case 0:
+        case '0':
+        case '7':
+            entry.kind = SA_ENTRY_FILE;
+            break;
+        case '5':
+            entry.kind = SA_ENTRY_DIRECTORY;
+            entry.compressed_size = 0;
+            entry.uncompressed_size = 0;
+            break;
+        case '1':
+            entry.kind = SA_ENTRY_HARD_LINK;
+            break;
+        case '2':
+            entry.kind = SA_ENTRY_SYMBOLIC_LINK;
+            break;
+        default:
+            entry.kind = SA_ENTRY_OTHER_LINK;
+            break;
+        }
+        if (archive->entries.size() >= archive->limits.maximum_entry_count)
+            return fail(error, SA_ERROR_RESOURCE_LIMIT, 0, "Archive contains too many entries");
+        archive->entries.push_back(std::move(entry));
+
+        uint64_t effective_padded_size = (size + 511) & ~uint64_t(511);
+        if (effective_padded_size < size || effective_padded_size > file_size - offset - 512)
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR entry data is truncated");
+        offset += 512 + effective_padded_size;
+    }
+    if (archive->entries.empty() && !saw_end_marker)
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "TAR archive has no valid entries");
+    return validate_archive_limits(archive, error);
+}
+
+bool read_little_endian_u16(std::ifstream &stream, uint16_t &value) {
+    uint8_t bytes[2]{};
+    stream.read(reinterpret_cast<char *>(bytes), sizeof(bytes));
+    if (stream.gcount() != sizeof(bytes))
+        return false;
+    value = static_cast<uint16_t>(bytes[0]) | (static_cast<uint16_t>(bytes[1]) << 8);
+    return true;
+}
+
+std::string gzip_output_name(const std::string &archive_path, const std::string &header_name) {
+    if (!header_name.empty() && valid_utf8(header_name)) {
+        std::string normalized = header_name;
+        std::replace(normalized.begin(), normalized.end(), '\\', '/');
+        std::string basename = fs::path(normalized).filename().string();
+        if (!basename.empty() && basename != "." && basename != "..")
+            return basename;
+    }
+    fs::path path(archive_path);
+    std::string filename = path.filename().string();
+    std::string lower = filename;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    if (lower.size() > 5 && lower.substr(lower.size() - 5) == ".gzip")
+        filename.resize(filename.size() - 5);
+    else if (lower.size() > 3 && lower.substr(lower.size() - 3) == ".gz")
+        filename.resize(filename.size() - 3);
+    else if (lower.size() > 4 && lower.substr(lower.size() - 4) == ".tgz")
+        filename = filename.substr(0, filename.size() - 4) + ".tar";
+    return filename.empty() ? "Uncompressed" : filename;
+}
+
+int32_t list_gzip(SAArchive *archive, SAError *error) {
+    std::ifstream stream(archive->path, std::ios::binary);
+    if (!stream)
+        return fail(error, SA_ERROR_OPEN_FAILED, errno, "Unable to open GZIP archive");
+    std::error_code file_error;
+    uint64_t file_size = fs::file_size(archive->path, file_error);
+    if (file_error || file_size < 18)
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, file_error.value(), "GZIP archive is truncated");
+
+    uint8_t header[10]{};
+    stream.read(reinterpret_cast<char *>(header), sizeof(header));
+    if (stream.gcount() != sizeof(header) || header[0] != 0x1f || header[1] != 0x8b ||
+        header[2] != 8 || (header[3] & 0xe0) != 0)
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "GZIP header is invalid");
+    uint8_t flags = header[3];
+    uint64_t header_length = 10;
+    if ((flags & 0x04) != 0) {
+        uint16_t extra_length = 0;
+        if (!read_little_endian_u16(stream, extra_length) || header_length + 2 + extra_length > file_size - 8)
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "GZIP extra data is truncated");
+        stream.seekg(extra_length, std::ios::cur);
+        header_length += 2 + extra_length;
+    }
+    auto read_zero_terminated = [&](std::string *output) -> bool {
+        constexpr uint64_t maximum_field_size = 1024 * 1024;
+        for (uint64_t count = 0; count < maximum_field_size && header_length < file_size - 8; ++count) {
+            char value = 0;
+            stream.get(value);
+            ++header_length;
+            if (!stream)
+                return false;
+            if (value == 0)
+                return true;
+            if (output)
+                output->push_back(value);
+        }
+        return false;
+    };
+    std::string original_name;
+    if ((flags & 0x08) != 0 && !read_zero_terminated(&original_name))
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "GZIP filename is invalid");
+    if ((flags & 0x10) != 0 && !read_zero_terminated(nullptr))
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "GZIP comment is invalid");
+    if ((flags & 0x02) != 0) {
+        if (header_length + 2 > file_size - 8)
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "GZIP header checksum is truncated");
+        stream.seekg(2, std::ios::cur);
+        header_length += 2;
+    }
+
+    stream.seekg(-4, std::ios::end);
+    uint8_t size_bytes[4]{};
+    stream.read(reinterpret_cast<char *>(size_bytes), sizeof(size_bytes));
+    if (stream.gcount() != sizeof(size_bytes))
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0, "GZIP footer is truncated");
+    uint64_t uncompressed_size = static_cast<uint64_t>(size_bytes[0]) |
+                                 (static_cast<uint64_t>(size_bytes[1]) << 8) |
+                                 (static_cast<uint64_t>(size_bytes[2]) << 16) |
+                                 (static_cast<uint64_t>(size_bytes[3]) << 24);
+    uint64_t modification_time = static_cast<uint64_t>(header[4]) |
+                                 (static_cast<uint64_t>(header[5]) << 8) |
+                                 (static_cast<uint64_t>(header[6]) << 16) |
+                                 (static_cast<uint64_t>(header[7]) << 24);
+    Entry entry;
+    entry.path = gzip_output_name(archive->path, original_name);
+    entry.compressed_size = file_size - header_length - 8;
+    entry.uncompressed_size = uncompressed_size;
+    entry.modification_time = static_cast<int64_t>(modification_time);
+    archive->entries.push_back(std::move(entry));
+    return validate_archive_limits(archive, error);
+}
+
+int32_t stream_tar_entry(SAArchive *archive, uint64_t index,
+                         SADataCallback callback, void *data_context,
+                         SAProgressCallback progress, void *progress_context,
+                         uint64_t total_base, uint64_t total_size, SAError *error) {
+    const Entry &entry = archive->entries[index];
+    FILE *source = std::fopen(archive->path.c_str(), "rb");
+    if (!source)
+        return fail(error, SA_ERROR_OPEN_FAILED, errno, "Unable to open TAR archive");
+    if (fseeko(source, static_cast<off_t>(entry.data_offset), SEEK_SET) != 0) {
+        int backend_error = errno;
+        std::fclose(source);
+        return fail(error, SA_ERROR_IO, backend_error, "Unable to seek to TAR entry");
+    }
+
+    uint64_t completed = 0;
+    uint8_t buffer[128 * 1024];
+    while (completed < entry.uncompressed_size) {
+        if (archive->cancelled.load()) {
+            std::fclose(source);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+        size_t requested = static_cast<size_t>(std::min<uint64_t>(
+            sizeof(buffer), entry.uncompressed_size - completed));
+        size_t read = std::fread(buffer, 1, requested, source);
+        if (read != requested) {
+            int backend_error = std::ferror(source) ? errno : 0;
+            std::fclose(source);
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, backend_error,
+                        "TAR entry data is truncated");
+        }
+        if (callback && callback(data_context, buffer, read) == 0) {
+            archive->cancelled.store(true);
+            std::fclose(source);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+        completed += read;
+        SAProgress state{sizeof(SAProgress), index, entry.path.c_str(), completed,
+                         entry.uncompressed_size, total_base + completed, total_size};
+        if (progress && progress(progress_context, &state) == 0) {
+            archive->cancelled.store(true);
+            std::fclose(source);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+    }
+    std::fclose(source);
+    return 1;
+}
+
+int32_t stream_gzip_entry(SAArchive *archive, uint64_t index,
+                          SADataCallback callback, void *data_context,
+                          SAProgressCallback progress, void *progress_context,
+                          SAError *error) {
+    const Entry &entry = archive->entries[index];
+    gzFile source = gzopen(archive->path.c_str(), "rb");
+    if (!source)
+        return fail(error, SA_ERROR_OPEN_FAILED, errno, "Unable to open GZIP archive");
+    uint64_t completed = 0;
+    uint8_t buffer[128 * 1024];
+    while (true) {
+        if (archive->cancelled.load()) {
+            gzclose(source);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+        int read = gzread(source, buffer, static_cast<unsigned int>(sizeof(buffer)));
+        if (read < 0) {
+            int backend_error = Z_DATA_ERROR;
+            const char *message = gzerror(source, &backend_error);
+            std::string description = message ? message : "Unable to decompress GZIP archive";
+            gzclose(source);
+            return fail(error, SA_ERROR_CORRUPT_ARCHIVE, backend_error, description);
+        }
+        if (read == 0)
+            break;
+        uint64_t chunk_size = static_cast<uint64_t>(read);
+        uint64_t output_limit = std::min(
+            archive->limits.maximum_entry_size,
+            archive->limits.maximum_total_size
+        );
+        if (chunk_size > output_limit || completed > output_limit - chunk_size) {
+            gzclose(source);
+            return fail(error, SA_ERROR_RESOURCE_LIMIT, 0,
+                        "GZIP output exceeds the configured size limit");
+        }
+        completed += chunk_size;
+        if (entry.compressed_size > 0 && archive->limits.maximum_compression_ratio > 0 &&
+            static_cast<double>(completed) / static_cast<double>(entry.compressed_size) >
+                archive->limits.maximum_compression_ratio) {
+            gzclose(source);
+            return fail(error, SA_ERROR_RESOURCE_LIMIT, 0,
+                        "GZIP output exceeds the configured compression ratio");
+        }
+        if (callback && callback(data_context, buffer, static_cast<size_t>(read)) == 0) {
+            archive->cancelled.store(true);
+            gzclose(source);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+        SAProgress state{sizeof(SAProgress), index, entry.path.c_str(), completed,
+                         entry.uncompressed_size, completed, entry.uncompressed_size};
+        if (progress && progress(progress_context, &state) == 0) {
+            archive->cancelled.store(true);
+            gzclose(source);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+    }
+    int close_result = gzclose(source);
+    if (close_result != Z_OK)
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, close_result,
+                    "GZIP checksum validation failed");
+    if (static_cast<uint32_t>(completed) != static_cast<uint32_t>(entry.uncompressed_size))
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0,
+                    "GZIP uncompressed size does not match its footer");
+    return 1;
+}
+
+struct FileWriteContext {
+    FILE *file = nullptr;
+    bool failed = false;
+    int backend_error = 0;
+};
+
+int32_t file_write_callback(void *context, const uint8_t *bytes, size_t length) {
+    auto *writer = static_cast<FileWriteContext *>(context);
+    if (!writer || !writer->file)
+        return 0;
+    if (std::fwrite(bytes, 1, length, writer->file) != length) {
+        writer->failed = true;
+        writer->backend_error = errno;
+        return 0;
+    }
+    return 1;
+}
+
+int32_t finish_extracted_file(const std::string &temporary, const fs::path &output,
+                              const Entry &entry, const SAExtractionOptions &options,
+                              SAError *error) {
+    std::error_code ec;
+    if (fs::exists(fs::symlink_status(output, ec)))
+        fs::remove(output, ec);
+    fs::rename(temporary, output, ec);
+    if (ec) {
+        std::remove(temporary.c_str());
+        return fail(error, SA_ERROR_IO, ec.value(), "Unable to finish extracted file");
+    }
+    if (options.preserve_timestamps)
+        apply_modification_time(output, entry.modification_time);
+    return 1;
+}
+
+uint64_t total_uncompressed_size(const SAArchive *source) {
+    uint64_t total = 0;
+    for (const auto &entry : source->entries)
+        total += entry.uncompressed_size;
+    return total;
+}
+
+int32_t validate_libarchive_runtime_limits(SAArchive *source,
+                                           struct archive *reader,
+                                           uint64_t entry_completed,
+                                           uint64_t total_completed,
+                                           SAError *error) {
+    if (entry_completed > source->limits.maximum_entry_size ||
+        total_completed > source->limits.maximum_total_size)
+        return fail(error, SA_ERROR_RESOURCE_LIMIT, 0,
+                    "Archive output exceeds the configured size limit");
+    la_int64_t compressed = archive_filter_bytes(reader, -1);
+    if (compressed > 0 && total_completed >= 1024 * 1024 &&
+        source->limits.maximum_compression_ratio > 0 &&
+        static_cast<double>(total_completed) / static_cast<double>(compressed) >
+            source->limits.maximum_compression_ratio)
+        return fail(error, SA_ERROR_RESOURCE_LIMIT, 0,
+                    "Archive output exceeds the configured compression ratio");
+    return 1;
+}
+
+int32_t stream_active_libarchive_entry(SAArchive *source,
+                                       struct archive *reader,
+                                       uint64_t entry_index,
+                                       SADataCallback callback,
+                                       void *data_context,
+                                       SAProgressCallback progress,
+                                       void *progress_context,
+                                       uint64_t total_base,
+                                       uint64_t total_size,
+                                       SAError *error) {
+    const Entry &entry = source->entries[entry_index];
+    uint64_t completed = 0;
+    uint8_t buffer[128 * 1024];
+    while (true) {
+        if (source->cancelled.load())
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        la_ssize_t read = archive_read_data(reader, buffer, sizeof(buffer));
+        if (read < 0)
+            return fail_libarchive(error, reader, !source->password.empty(),
+                                   "Unable to read archive entry");
+        if (read == 0)
+            break;
+        uint64_t chunk_size = static_cast<uint64_t>(read);
+        if (UINT64_MAX - completed < chunk_size ||
+            UINT64_MAX - total_base < completed + chunk_size)
+            return fail(error, SA_ERROR_RESOURCE_LIMIT, 0,
+                        "Archive output size overflowed");
+        completed += chunk_size;
+        if (!validate_libarchive_runtime_limits(source, reader, completed,
+                                                total_base + completed, error))
+            return 0;
+        if (callback && callback(data_context, buffer, static_cast<size_t>(read)) == 0) {
+            source->cancelled.store(true);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+        SAProgress state{sizeof(SAProgress), entry_index, entry.path.c_str(), completed,
+                         entry.uncompressed_size, total_base + completed, total_size};
+        if (progress && progress(progress_context, &state) == 0) {
+            source->cancelled.store(true);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+    }
+    if (entry.uncompressed_size > 0 && completed != entry.uncompressed_size)
+        return fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0,
+                    "Archive entry size does not match its header");
+    return 1;
+}
+
+int32_t skip_to_libarchive_entry(SAArchive *source, struct archive *reader,
+                                 uint64_t entry_index, SAError *error) {
+    uint64_t target = source->entries[entry_index].data_offset;
+    uint64_t native_index = 0;
+    struct archive_entry *header = nullptr;
+    while (true) {
+        int result = archive_read_next_header(reader, &header);
+        if (result == ARCHIVE_EOF)
+            return fail(error, SA_ERROR_ENTRY_NOT_FOUND, 0,
+                        "Archive entry was not found");
+        if (result < ARCHIVE_OK)
+            return fail_libarchive(error, reader, !source->password.empty(),
+                                   "Unable to read archive directory");
+        if (native_index == target)
+            return 1;
+        result = archive_read_data_skip(reader);
+        if (result < ARCHIVE_OK)
+            return fail_libarchive(error, reader, !source->password.empty(),
+                                   "Unable to skip archive entry");
+        ++native_index;
+    }
+}
+
+int32_t extract_one_libarchive(SAArchive *source, uint64_t entry_index,
+                               const fs::path &root,
+                               const SAExtractionOptions &options,
+                               SAProgressCallback progress, void *context,
+                               SAError *error) {
+    const Entry &entry = source->entries[entry_index];
+    if (!require_libarchive_password(source, entry, error))
+        return 0;
+    fs::path output;
+    bool skip = false;
+    if (!prepare_output_path(root, entry, options.overwrite_policy, output, skip, error))
+        return 0;
+    if (entry.kind == SA_ENTRY_DIRECTORY || skip) {
+        if (entry.kind == SA_ENTRY_DIRECTORY && options.preserve_timestamps)
+            apply_modification_time(output, entry.modification_time);
+        return 1;
+    }
+    if (entry.kind != SA_ENTRY_FILE)
+        return fail(error, SA_ERROR_UNSAFE_LINK, 0, "Link extraction is disabled");
+
+    struct archive *reader = open_libarchive_reader(source, error);
+    if (!reader)
+        return 0;
+    if (!skip_to_libarchive_entry(source, reader, entry_index, error)) {
+        archive_read_free(reader);
+        return 0;
+    }
+
+    std::string temporary = temporary_path_for(output, entry_index);
+    FileWriteContext writer{std::fopen(temporary.c_str(), "wb")};
+    if (!writer.file) {
+        archive_read_free(reader);
+        return fail(error, SA_ERROR_IO, errno, "Unable to create extracted file");
+    }
+    int32_t success = stream_active_libarchive_entry(
+        source, reader, entry_index, file_write_callback, &writer,
+        progress, context, 0, entry.uncompressed_size, error);
+    if (std::fclose(writer.file) != 0 && success)
+        success = fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
+    archive_read_free(reader);
+    if (writer.failed) {
+        std::remove(temporary.c_str());
+        return fail(error, SA_ERROR_IO, writer.backend_error,
+                    "Unable to write extracted file");
+    }
+    if (!success) {
+        std::remove(temporary.c_str());
+        return 0;
+    }
+    return finish_extracted_file(temporary, output, entry, options, error);
+}
+
+int32_t extract_libarchive(SAArchive *source, const fs::path &root,
+                           const SAExtractionOptions &options,
+                           SAProgressCallback progress, void *context,
+                           SAError *error) {
+    for (const auto &entry : source->entries) {
+        if (!require_libarchive_password(source, entry, error))
+            return 0;
+    }
+    struct archive *reader = open_libarchive_reader(source, error);
+    if (!reader)
+        return 0;
+
+    uint64_t total_size = total_uncompressed_size(source);
+    uint64_t total_completed = 0;
+    uint64_t native_index = 0;
+    uint64_t logical_index = 0;
+    struct archive_entry *header = nullptr;
+    int result = ARCHIVE_OK;
+    while ((result = archive_read_next_header(reader, &header)) == ARCHIVE_OK) {
+        if (source->cancelled.load()) {
+            archive_read_free(reader);
+            return fail(error, SA_ERROR_CANCELLED, 0, "Operation was cancelled");
+        }
+        if (logical_index >= source->entries.size() ||
+            source->entries[logical_index].data_offset != native_index) {
+            result = archive_read_data_skip(reader);
+            if (result < ARCHIVE_OK)
+                break;
+            ++native_index;
+            continue;
+        }
+
+        const Entry &entry = source->entries[logical_index];
+        fs::path output;
+        bool skip = false;
+        if (!prepare_output_path(root, entry, options.overwrite_policy,
+                                 output, skip, error)) {
+            archive_read_free(reader);
+            return 0;
+        }
+        if (entry.kind == SA_ENTRY_DIRECTORY || skip) {
+            result = archive_read_data_skip(reader);
+            if (entry.kind == SA_ENTRY_DIRECTORY && options.preserve_timestamps)
+                apply_modification_time(output, entry.modification_time);
+        } else if (entry.kind != SA_ENTRY_FILE) {
+            archive_read_free(reader);
+            return fail(error, SA_ERROR_UNSAFE_LINK, 0, "Link extraction is disabled");
+        } else {
+            std::string temporary = temporary_path_for(output, logical_index);
+            FileWriteContext writer{std::fopen(temporary.c_str(), "wb")};
+            if (!writer.file) {
+                archive_read_free(reader);
+                return fail(error, SA_ERROR_IO, errno, "Unable to create extracted file");
+            }
+            int32_t success = stream_active_libarchive_entry(
+                source, reader, logical_index, file_write_callback, &writer,
+                progress, context, total_completed, total_size, error);
+            if (std::fclose(writer.file) != 0 && success)
+                success = fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
+            if (writer.failed) {
+                std::remove(temporary.c_str());
+                archive_read_free(reader);
+                return fail(error, SA_ERROR_IO, writer.backend_error,
+                            "Unable to write extracted file");
+            }
+            if (!success) {
+                std::remove(temporary.c_str());
+                archive_read_free(reader);
+                return 0;
+            }
+            if (!finish_extracted_file(temporary, output, entry, options, error)) {
+                archive_read_free(reader);
+                return 0;
+            }
+            result = ARCHIVE_OK;
+        }
+        if (result < ARCHIVE_OK)
+            break;
+        total_completed += entry.uncompressed_size;
+        ++logical_index;
+        ++native_index;
+    }
+
+    if (result != ARCHIVE_EOF || logical_index != source->entries.size()) {
+        int32_t failure = result == ARCHIVE_EOF
+            ? fail(error, SA_ERROR_CORRUPT_ARCHIVE, 0,
+                   "Archive directory changed while extracting")
+            : fail_libarchive(error, reader, !source->password.empty(),
+                              "Unable to continue reading archive");
+        archive_read_free(reader);
+        return failure;
+    }
+    archive_read_free(reader);
+    if (options.preserve_timestamps) {
+        for (auto iterator = source->entries.rbegin(); iterator != source->entries.rend(); ++iterator) {
+            if (iterator->kind == SA_ENTRY_DIRECTORY)
+                apply_modification_time(root / iterator->path, iterator->modification_time);
+        }
+    }
+    return 1;
+}
+
+int32_t read_libarchive_entry(SAArchive *source, uint64_t entry_index,
+                              SADataCallback callback, void *context,
+                              SAError *error) {
+    const Entry &entry = source->entries[entry_index];
+    if (!require_libarchive_password(source, entry, error))
+        return 0;
+    struct archive *reader = open_libarchive_reader(source, error);
+    if (!reader)
+        return 0;
+    if (!skip_to_libarchive_entry(source, reader, entry_index, error)) {
+        archive_read_free(reader);
+        return 0;
+    }
+    int32_t success = stream_active_libarchive_entry(
+        source, reader, entry_index, callback, context, nullptr, nullptr,
+        0, entry.uncompressed_size, error);
+    archive_read_free(reader);
+    return success;
+}
+
+int32_t extract_tar_entry(SAArchive *archive, uint64_t index, const fs::path &root,
+                          const SAExtractionOptions &options,
+                          SAProgressCallback progress, void *context,
+                          uint64_t total_base, uint64_t total_size, SAError *error) {
+    const Entry &entry = archive->entries[index];
+    fs::path output;
+    bool skip = false;
+    if (!prepare_output_path(root, entry, options.overwrite_policy, output, skip, error))
+        return 0;
+    if (entry.kind == SA_ENTRY_DIRECTORY || skip) {
+        if (entry.kind == SA_ENTRY_DIRECTORY && options.preserve_timestamps)
+            apply_modification_time(output, entry.modification_time);
+        return 1;
+    }
+    if (entry.kind != SA_ENTRY_FILE)
+        return fail(error, SA_ERROR_UNSAFE_LINK, 0, "Link extraction is disabled");
+
+    std::string temporary = temporary_path_for(output, index);
+    FileWriteContext writer{std::fopen(temporary.c_str(), "wb")};
+    if (!writer.file)
+        return fail(error, SA_ERROR_IO, errno, "Unable to create extracted file");
+    int32_t success = stream_tar_entry(archive, index, file_write_callback, &writer,
+                                       progress, context, total_base, total_size, error);
+    if (std::fclose(writer.file) != 0 && success)
+        success = fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
+    if (writer.failed) {
+        std::remove(temporary.c_str());
+        archive->cancelled.store(false);
+        return fail(error, SA_ERROR_IO, writer.backend_error, "Unable to write extracted file");
+    }
+    if (!success) {
+        std::remove(temporary.c_str());
+        return 0;
+    }
+    return finish_extracted_file(temporary, output, entry, options, error);
+}
+
+int32_t extract_tar(SAArchive *archive, const fs::path &root,
+                    const SAExtractionOptions &options,
+                    SAProgressCallback progress, void *context, SAError *error) {
+    uint64_t total_size = 0;
+    for (const auto &entry : archive->entries)
+        total_size += entry.uncompressed_size;
+    uint64_t total_completed = 0;
+    for (uint64_t index = 0; index < archive->entries.size(); ++index) {
+        if (!extract_tar_entry(archive, index, root, options, progress, context,
+                               total_completed, total_size, error))
+            return 0;
+        total_completed += archive->entries[index].uncompressed_size;
+    }
+    if (options.preserve_timestamps) {
+        for (auto iterator = archive->entries.rbegin(); iterator != archive->entries.rend(); ++iterator) {
+            if (iterator->kind == SA_ENTRY_DIRECTORY)
+                apply_modification_time(root / iterator->path, iterator->modification_time);
+        }
+    }
+    return 1;
+}
+
+int32_t extract_gzip(SAArchive *archive, const fs::path &root,
+                     const SAExtractionOptions &options,
+                     SAProgressCallback progress, void *context, SAError *error) {
+    const Entry &entry = archive->entries[0];
+    fs::path output;
+    bool skip = false;
+    if (!prepare_output_path(root, entry, options.overwrite_policy, output, skip, error))
+        return 0;
+    if (skip)
+        return 1;
+    std::string temporary = temporary_path_for(output, 0);
+    FileWriteContext writer{std::fopen(temporary.c_str(), "wb")};
+    if (!writer.file)
+        return fail(error, SA_ERROR_IO, errno, "Unable to create extracted file");
+    int32_t success = stream_gzip_entry(archive, 0, file_write_callback, &writer,
+                                        progress, context, error);
+    if (std::fclose(writer.file) != 0 && success)
+        success = fail(error, SA_ERROR_IO, errno, "Unable to close extracted file");
+    if (writer.failed) {
+        std::remove(temporary.c_str());
+        archive->cancelled.store(false);
+        return fail(error, SA_ERROR_IO, writer.backend_error, "Unable to write extracted file");
+    }
+    if (!success) {
+        std::remove(temporary.c_str());
+        return 0;
+    }
+    return finish_extracted_file(temporary, output, entry, options, error);
 }
 
 int32_t open_zip_reader(SAArchive *archive, void **reader, SAError *error) {
@@ -1038,6 +2100,47 @@ int32_t collect_zip_inputs(const char *const *source_paths, const char *const *a
     return 1;
 }
 
+bool is_zip_split_volume(const fs::path &candidate, const fs::path &archive_path) {
+    if (candidate.stem() != archive_path.stem())
+        return false;
+    std::string extension = candidate.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    if (extension.size() < 4 || extension[0] != '.' || extension[1] != 'z')
+        return false;
+    return std::all_of(extension.begin() + 2, extension.end(), [](unsigned char value) {
+        return std::isdigit(value) != 0;
+    });
+}
+
+std::vector<fs::path> zip_split_volumes(const fs::path &archive_path) {
+    std::vector<fs::path> volumes;
+    fs::path directory = archive_path.parent_path();
+    if (directory.empty())
+        directory = fs::current_path();
+    std::error_code error;
+    fs::directory_iterator iterator(directory, error);
+    if (error)
+        return volumes;
+    for (const auto &item : iterator) {
+        if (is_zip_split_volume(item.path(), archive_path))
+            volumes.push_back(item.path());
+    }
+    return volumes;
+}
+
+void remove_zip_outputs(const fs::path &archive_path, bool includes_split_volumes) {
+    std::error_code error;
+    fs::remove(archive_path, error);
+    if (!includes_split_volumes)
+        return;
+    for (const auto &volume : zip_split_volumes(archive_path)) {
+        error.clear();
+        fs::remove(volume, error);
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -1101,13 +2204,17 @@ SAArchive *swiftarchive_archive_open(const char *path, SAArchiveFormat format,
             fail(error, SA_ERROR_OPEN_FAILED, 0, "Unable to open archive");
             return nullptr;
         }
-        uint8_t magic[8]{};
+        uint8_t magic[512]{};
         size_t count = std::fread(magic, 1, sizeof(magic), file);
         std::fclose(file);
         if (count >= 4 && magic[0] == 'P' && magic[1] == 'K')
             format = SA_ARCHIVE_FORMAT_ZIP;
         else if (count >= 7 && std::memcmp(magic, "Rar!\x1a\x07", 6) == 0)
             format = SA_ARCHIVE_FORMAT_RAR;
+        else if (count >= 2 && magic[0] == 0x1f && magic[1] == 0x8b)
+            format = SA_ARCHIVE_FORMAT_GZIP;
+        else if (count >= 262 && std::memcmp(magic + 257, "ustar", 5) == 0)
+            format = SA_ARCHIVE_FORMAT_TAR;
         else {
             SAError local_error{};
             SAError *attempt_error = error ? error : &local_error;
@@ -1115,12 +2222,23 @@ SAArchive *swiftarchive_archive_open(const char *path, SAArchiveFormat format,
                 clear_error(attempt_error);
                 archive->entries.clear();
                 archive->format = candidate;
-                return candidate == SA_ARCHIVE_FORMAT_ZIP ? list_zip(archive, attempt_error)
-                                                          : list_rar(archive, attempt_error);
+                switch (candidate) {
+                case SA_ARCHIVE_FORMAT_ZIP:
+                    return list_zip(archive, attempt_error);
+                case SA_ARCHIVE_FORMAT_RAR:
+                    return list_rar(archive, attempt_error);
+                case SA_ARCHIVE_FORMAT_TAR:
+                    return list_tar(archive, attempt_error);
+                case SA_ARCHIVE_FORMAT_GZIP:
+                    return list_gzip(archive, attempt_error);
+                default:
+                    return 0;
+                }
             };
             auto is_conclusive_error = [](SAErrorCode code) {
-                return code != SA_ERROR_UNSUPPORTED_FORMAT && code != SA_ERROR_OPEN_FAILED &&
-                       code != SA_ERROR_CORRUPT_ARCHIVE;
+                return code == SA_ERROR_PASSWORD_REQUIRED || code == SA_ERROR_BAD_PASSWORD ||
+                       code == SA_ERROR_UNSAFE_PATH || code == SA_ERROR_UNSAFE_LINK ||
+                       code == SA_ERROR_RESOURCE_LIMIT || code == SA_ERROR_CANCELLED;
             };
 
             if (try_format(SA_ARCHIVE_FORMAT_ZIP))
@@ -1135,18 +2253,82 @@ SAArchive *swiftarchive_archive_open(const char *path, SAArchiveFormat format,
                 delete archive;
                 return nullptr;
             }
+            if (try_format(SA_ARCHIVE_FORMAT_TAR))
+                return archive;
+            if (is_conclusive_error(attempt_error->code)) {
+                delete archive;
+                return nullptr;
+            }
+            if (try_format(SA_ARCHIVE_FORMAT_GZIP))
+                return archive;
+            if (is_conclusive_error(attempt_error->code)) {
+                delete archive;
+                return nullptr;
+            }
+
+            clear_error(attempt_error);
+            archive->entries.clear();
+            archive->format = SA_ARCHIVE_FORMAT_AUTO;
+            if (list_libarchive(archive, attempt_error))
+                return archive;
+            if (is_conclusive_error(attempt_error->code)) {
+                delete archive;
+                return nullptr;
+            }
 
             delete archive;
-            fail(error, SA_ERROR_UNSUPPORTED_FORMAT, 0, "Archive format is not supported");
             return nullptr;
         }
     }
     archive->format = format;
-    int32_t success = format == SA_ARCHIVE_FORMAT_ZIP ? list_zip(archive, error)
-                                                       : format == SA_ARCHIVE_FORMAT_RAR ? list_rar(archive, error)
-                                                                                         : 0;
+    int32_t success = 0;
+    switch (format) {
+    case SA_ARCHIVE_FORMAT_ZIP:
+        success = list_zip(archive, error);
+        break;
+    case SA_ARCHIVE_FORMAT_RAR:
+        success = list_rar(archive, error);
+        break;
+    case SA_ARCHIVE_FORMAT_TAR:
+        success = list_tar(archive, error);
+        break;
+    case SA_ARCHIVE_FORMAT_GZIP:
+        success = list_gzip(archive, error);
+        break;
+    case SA_ARCHIVE_FORMAT_7ZIP:
+    case SA_ARCHIVE_FORMAT_BZIP2:
+    case SA_ARCHIVE_FORMAT_XZ:
+    case SA_ARCHIVE_FORMAT_LZMA:
+    case SA_ARCHIVE_FORMAT_LZIP:
+    case SA_ARCHIVE_FORMAT_COMPRESS:
+    case SA_ARCHIVE_FORMAT_ZSTD:
+    case SA_ARCHIVE_FORMAT_LZ4:
+    case SA_ARCHIVE_FORMAT_CAB:
+    case SA_ARCHIVE_FORMAT_CPIO:
+    case SA_ARCHIVE_FORMAT_ISO9660:
+    case SA_ARCHIVE_FORMAT_LHA:
+    case SA_ARCHIVE_FORMAT_AR:
+    case SA_ARCHIVE_FORMAT_WARC:
+        archive->format = SA_ARCHIVE_FORMAT_AUTO;
+        success = list_libarchive(archive, error);
+        break;
+    default:
+        break;
+    }
+    if (!success && format == SA_ARCHIVE_FORMAT_ZIP) {
+        SAErrorCode code = error ? error->code : SA_ERROR_NONE;
+        bool conclusive = code == SA_ERROR_PASSWORD_REQUIRED || code == SA_ERROR_BAD_PASSWORD ||
+                          code == SA_ERROR_UNSAFE_PATH || code == SA_ERROR_UNSAFE_LINK ||
+                          code == SA_ERROR_RESOURCE_LIMIT || code == SA_ERROR_CANCELLED;
+        if (!conclusive) {
+            clear_error(error);
+            archive->entries.clear();
+            archive->format = SA_ARCHIVE_FORMAT_AUTO;
+            success = list_libarchive(archive, error);
+        }
+    }
     if (!success) {
-        if (format != SA_ARCHIVE_FORMAT_ZIP && format != SA_ARCHIVE_FORMAT_RAR)
+        if (!error || error->code == SA_ERROR_NONE)
             fail(error, SA_ERROR_UNSUPPORTED_FORMAT, 0, "Archive format is not supported");
         delete archive;
         return nullptr;
@@ -1194,7 +2376,7 @@ int32_t swiftarchive_archive_extract_all(SAArchive *archive, const char *destina
     clear_error(error);
     if (!archive || !destination || destination[0] == 0)
         return fail(error, SA_ERROR_INVALID_ARGUMENT, 0, "Destination path is empty");
-    if (archive->format == SA_ARCHIVE_FORMAT_ZIP) {
+    if (!archive->uses_libarchive && archive->format == SA_ARCHIVE_FORMAT_ZIP) {
         for (const auto &entry : archive->entries) {
             if (!require_zip_password(archive, entry, error))
                 return 0;
@@ -1209,9 +2391,17 @@ int32_t swiftarchive_archive_extract_all(SAArchive *archive, const char *destina
         return fail(error, SA_ERROR_IO, ec.value(), "Unable to create destination directory");
     if (fs::is_symlink(fs::symlink_status(root, ec)))
         return fail(error, SA_ERROR_UNSAFE_PATH, 0, "Destination is a symbolic link");
+    if (archive->uses_libarchive)
+        return extract_libarchive(archive, root, effective, progress, context, error);
     if (archive->format == SA_ARCHIVE_FORMAT_ZIP)
         return extract_zip(archive, root, effective, progress, context, error);
-    return extract_rar(archive, root, effective, progress, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_RAR)
+        return extract_rar(archive, root, effective, progress, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_TAR)
+        return extract_tar(archive, root, effective, progress, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_GZIP)
+        return extract_gzip(archive, root, effective, progress, context, error);
+    return fail(error, SA_ERROR_UNSUPPORTED_FORMAT, 0, "Archive format is not supported");
 }
 
 int32_t swiftarchive_archive_extract_entry(SAArchive *archive, uint64_t index,
@@ -1222,7 +2412,7 @@ int32_t swiftarchive_archive_extract_entry(SAArchive *archive, uint64_t index,
     clear_error(error);
     if (!archive || index >= archive->entries.size() || !destination || destination[0] == 0)
         return fail(error, SA_ERROR_INVALID_ARGUMENT, 0, "Invalid entry extraction request");
-    if (archive->format == SA_ARCHIVE_FORMAT_ZIP &&
+    if (!archive->uses_libarchive && archive->format == SA_ARCHIVE_FORMAT_ZIP &&
         !require_zip_password(archive, archive->entries[index], error))
         return 0;
     archive->cancelled.store(false);
@@ -1234,9 +2424,19 @@ int32_t swiftarchive_archive_extract_entry(SAArchive *archive, uint64_t index,
         return fail(error, SA_ERROR_IO, ec.value(), "Unable to create destination directory");
     if (fs::is_symlink(fs::symlink_status(root, ec)))
         return fail(error, SA_ERROR_UNSAFE_PATH, 0, "Destination is a symbolic link");
+    if (archive->uses_libarchive)
+        return extract_one_libarchive(archive, index, root, effective,
+                                      progress, context, error);
     if (archive->format == SA_ARCHIVE_FORMAT_ZIP)
         return extract_one_zip(archive, index, root, effective, progress, context, error);
-    return extract_one_rar(archive, index, root, effective, progress, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_RAR)
+        return extract_one_rar(archive, index, root, effective, progress, context, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_TAR)
+        return extract_tar_entry(archive, index, root, effective, progress, context,
+                                 0, archive->entries[index].uncompressed_size, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_GZIP)
+        return extract_gzip(archive, root, effective, progress, context, error);
+    return fail(error, SA_ERROR_UNSUPPORTED_FORMAT, 0, "Archive format is not supported");
 }
 
 int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
@@ -1247,10 +2447,12 @@ int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
         return fail(error, SA_ERROR_INVALID_ARGUMENT, 0, "Invalid entry read request");
     if (archive->entries[index].kind != SA_ENTRY_FILE)
         return fail(error, SA_ERROR_UNSUPPORTED_FEATURE, 0, "Only regular files can be read");
-    if (archive->format == SA_ARCHIVE_FORMAT_ZIP &&
+    if (!archive->uses_libarchive && archive->format == SA_ARCHIVE_FORMAT_ZIP &&
         !require_zip_password(archive, archive->entries[index], error))
         return 0;
     archive->cancelled.store(false);
+    if (archive->uses_libarchive)
+        return read_libarchive_entry(archive, index, callback, context, error);
     if (archive->format == SA_ARCHIVE_FORMAT_ZIP) {
         void *reader = nullptr;
         if (!open_zip_reader(archive, &reader, error))
@@ -1287,6 +2489,12 @@ int32_t swiftarchive_archive_read_entry(SAArchive *archive, uint64_t index,
                         "Unable to read ZIP entry");
         return 1;
     }
+
+    if (archive->format == SA_ARCHIVE_FORMAT_TAR)
+        return stream_tar_entry(archive, index, callback, context, nullptr, nullptr,
+                                0, archive->entries[index].uncompressed_size, error);
+    if (archive->format == SA_ARCHIVE_FORMAT_GZIP)
+        return stream_gzip_entry(archive, index, callback, context, nullptr, nullptr, error);
 
     RarCallbackContext callback_context{&archive->password, &archive->cancelled};
     callback_context.data_callback = callback;
@@ -1327,6 +2535,13 @@ int32_t swiftarchive_zip_create(const char *archive_path, const char *const *sou
     if (!archive_path || archive_path[0] == 0 || !source_paths || item_count == 0)
         return fail(error, SA_ERROR_INVALID_ARGUMENT, 0, "ZIP creation requires an output and input paths");
     SAZipCreateOptions effective = options ? *options : swiftarchive_zip_create_options_default();
+    fs::path output_path(archive_path);
+    std::error_code output_error;
+    if (fs::exists(fs::symlink_status(output_path, output_error)) ||
+        (effective.volume_size > 0 && !zip_split_volumes(output_path).empty()))
+        return fail(error, SA_ERROR_DESTINATION_EXISTS, 0, "ZIP output already exists");
+    if (output_error && output_error != std::errc::no_such_file_or_directory)
+        return fail(error, SA_ERROR_IO, output_error.value(), "Unable to inspect ZIP output");
     std::vector<ZipInput> items;
     if (!collect_zip_inputs(source_paths, archive_paths, item_count, effective, items, error))
         return 0;
@@ -1350,6 +2565,7 @@ int32_t swiftarchive_zip_create(const char *archive_path, const char *const *sou
     }
 
     uint64_t total_completed = 0;
+    bool callback_cancelled = false;
     for (uint64_t index = 0; index < items.size() && result == MZ_OK; ++index) {
         const ZipInput &item = items[index];
         mz_zip_file info{};
@@ -1392,6 +2608,7 @@ int32_t swiftarchive_zip_create(const char *archive_path, const char *const *sou
                     SAProgress state{sizeof(SAProgress), index, item.archive_path.c_str(), entry_completed,
                                      item.size, total_completed + entry_completed, total_size};
                     if (progress && progress(context, &state) == 0) {
+                        callback_cancelled = true;
                         result = MZ_INTERNAL_ERROR;
                         break;
                     }
@@ -1406,14 +2623,14 @@ int32_t swiftarchive_zip_create(const char *archive_path, const char *const *sou
     }
     int32_t close_result = mz_zip_writer_close(writer);
     mz_zip_writer_delete(&writer);
-    if (result == MZ_INTERNAL_ERROR) {
-        std::remove(archive_path);
+    if (callback_cancelled) {
+        remove_zip_outputs(output_path, effective.volume_size > 0);
         return fail(error, SA_ERROR_CANCELLED, result, "Operation was cancelled");
     }
     if (result == MZ_OK && close_result != MZ_OK)
         result = close_result;
     if (result != MZ_OK) {
-        std::remove(archive_path);
+        remove_zip_outputs(output_path, effective.volume_size > 0);
         return fail(error, minizip_error_code(result, effective.password && effective.password[0]), result,
                     "Unable to create ZIP archive");
     }
@@ -1421,7 +2638,7 @@ int32_t swiftarchive_zip_create(const char *archive_path, const char *const *sou
 }
 
 const char *swiftarchive_version(void) {
-    return "0.1.0";
+    return "0.2.0";
 }
 
 } // extern "C"

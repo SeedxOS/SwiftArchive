@@ -257,6 +257,59 @@ final class SwiftArchiveTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination.appending(path: "random.bin")), bytes)
     }
 
+    func testZIPCreationRejectsExistingOutputsAndCleansCancelledVolumes() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appending(path: "random.bin")
+        var state: UInt64 = 0x1020_3040_5060_7080
+        var bytes = Data(capacity: 512 * 1_024)
+        for _ in 0..<(512 * 1_024) {
+            state = state &* 6_364_136_223_846_793_005 &+ 1
+            bytes.append(UInt8(truncatingIfNeeded: state >> 32))
+        }
+        try bytes.write(to: source)
+
+        let existingURL = root.appending(path: "existing.zip")
+        let original = Data("keep existing archive".utf8)
+        try original.write(to: existingURL)
+        do {
+            try await ZipArchive.create(at: existingURL, inputs: [.init(sourceURL: source)])
+            XCTFail("Expected destinationExists")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .destinationExists)
+        }
+        XCTAssertEqual(try Data(contentsOf: existingURL), original)
+
+        let reservedURL = root.appending(path: "reserved.zip")
+        let reservedVolume = root.appending(path: "reserved.z01")
+        try original.write(to: reservedVolume)
+        do {
+            try await ZipArchive.create(
+                at: reservedURL,
+                inputs: [.init(sourceURL: source)],
+                options: .init(volumeSize: 32 * 1_024)
+            )
+            XCTFail("Expected destinationExists")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .destinationExists)
+        }
+        XCTAssertEqual(try Data(contentsOf: reservedVolume), original)
+
+        let cancelledURL = root.appending(path: "cancelled.zip")
+        do {
+            try await ZipArchive.create(
+                at: cancelledURL,
+                inputs: [.init(sourceURL: source)],
+                options: .init(volumeSize: 32 * 1_024)
+            ) { _ in false }
+            XCTFail("Expected cancelled")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .cancelled)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cancelledURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appending(path: "cancelled.z01").path))
+    }
+
     func testRARUnicodeSubdirectoriesAndExtraction() async throws {
         let archive = try ArchiveReader(url: fixture("rar5-subdirs.rar"))
         XCTAssertEqual(archive.format, .rar)
@@ -331,6 +384,283 @@ final class SwiftArchiveTests: XCTestCase {
         }
     }
 
+    func testTARListingStreamingAndExtraction() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archiveURL = root.appending(path: "sample.tar")
+        let payload = Data("TAR 中文内容\n".utf8)
+        try makeTAR(entries: [
+            ("folder", Data(), UInt8(ascii: "5")),
+            ("folder/说明.txt", payload, UInt8(ascii: "0")),
+        ]).write(to: archiveURL)
+
+        let archive = try ArchiveReader(url: archiveURL)
+        XCTAssertEqual(archive.format, .tar)
+        XCTAssertEqual(archive.entries.count, 2)
+        let entry = try XCTUnwrap(archive.entries.first { $0.path == "folder/说明.txt" })
+        XCTAssertEqual(entry.kind, .file)
+        XCTAssertEqual(entry.uncompressedSize, UInt64(payload.count))
+        let streamedPayload = try await archive.data(for: entry)
+        XCTAssertEqual(streamedPayload, payload)
+
+        let destination = root.appending(path: "extracted")
+        try await archive.extract(to: destination)
+        XCTAssertEqual(try Data(contentsOf: destination.appending(path: entry.path)), payload)
+    }
+
+    func testTARGNULongNameAndPAXPath() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let payload = Data("extended TAR metadata".utf8)
+
+        let gnuPath = String(repeating: "very-long-directory/", count: 7) + "gnu-file.txt"
+        let gnuURL = root.appending(path: "gnu-long-name.tar")
+        try makeTAR(entries: [
+            ("././@LongLink", Data((gnuPath + "\0").utf8), UInt8(ascii: "L")),
+            ("placeholder", payload, UInt8(ascii: "0")),
+        ]).write(to: gnuURL)
+        let gnuArchive = try ArchiveReader(url: gnuURL)
+        XCTAssertEqual(gnuArchive.entries.map(\.path), [gnuPath])
+        let gnuData = try await gnuArchive.data(for: gnuArchive.entries[0])
+        XCTAssertEqual(gnuData, payload)
+
+        let paxPath = String(repeating: "目录/", count: 30) + "说明.txt"
+        let paxURL = root.appending(path: "pax-path.tar")
+        let paxMetadata = makePAXRecord(key: "path", value: paxPath)
+            + makePAXRecord(key: "mtime", value: "1700000123.75")
+        try makeTAR(entries: [
+            ("PaxHeaders/file", Data(paxMetadata.utf8), UInt8(ascii: "x")),
+            ("placeholder", payload, UInt8(ascii: "0")),
+        ]).write(to: paxURL)
+        let paxArchive = try ArchiveReader(url: paxURL)
+        let paxEntry = try XCTUnwrap(paxArchive.entries.first)
+        XCTAssertEqual(paxEntry.path, paxPath)
+        XCTAssertEqual(Int(try XCTUnwrap(paxEntry.modificationDate).timeIntervalSince1970), 1_700_000_123)
+        let paxData = try await paxArchive.data(for: paxEntry)
+        XCTAssertEqual(paxData, payload)
+    }
+
+    func testTARUnsafePathsAndLinksAreRejected() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let unsafeURL = root.appending(path: "unsafe.tar")
+        try makeTAR(entries: [("../outside.txt", Data("bad".utf8), UInt8(ascii: "0"))])
+            .write(to: unsafeURL)
+        XCTAssertThrowsError(try ArchiveReader(url: unsafeURL)) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsafePath)
+        }
+
+        let linkURL = root.appending(path: "link.tar")
+        try makeTAR(entries: [("link", Data(), UInt8(ascii: "2"))]).write(to: linkURL)
+        XCTAssertThrowsError(try ArchiveReader(url: linkURL)) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsafeLink)
+        }
+    }
+
+    func testTARProgressCancellationRemovesPartialOutput() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archiveURL = root.appending(path: "cancel.tar")
+        try makeTAR(entries: [
+            ("large.bin", Data(repeating: 0x5a, count: 512 * 1024), UInt8(ascii: "0")),
+        ]).write(to: archiveURL)
+        let archive = try ArchiveReader(url: archiveURL)
+        let destination = root.appending(path: "cancelled")
+        do {
+            try await archive.extract(to: destination) { _ in false }
+            XCTFail("Expected cancellation")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .cancelled)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appending(path: "large.bin").path))
+    }
+
+    func testGZIPStreamingExtractionAndResourceLimit() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archiveURL = root.appending(path: "payload.txt.gz")
+        let gzip = try XCTUnwrap(Data(base64Encoded: "H4sIAAAAAAAAA3OP8gxQKEiszMlPTOECAOZRTLUNAAAA"))
+        try gzip.write(to: archiveURL)
+
+        let archive = try ArchiveReader(url: archiveURL)
+        XCTAssertEqual(archive.format, .gzip)
+        XCTAssertEqual(archive.entries.map(\.path), ["payload.txt"])
+        let expected = Data("GZIP payload\n".utf8)
+        let streamedPayload = try await archive.data(for: archive.entries[0])
+        XCTAssertEqual(streamedPayload, expected)
+
+        let destination = root.appending(path: "extracted")
+        try await archive.extract(to: destination)
+        XCTAssertEqual(try Data(contentsOf: destination.appending(path: "payload.txt")), expected)
+
+        let limits = ArchiveLimits(maximumEntrySize: 8)
+        XCTAssertThrowsError(try ArchiveReader(url: archiveURL, options: .init(limits: limits))) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .resourceLimit)
+        }
+    }
+
+    func testGZIPCorruptionAndForgedFooterAreRejectedWhileStreaming() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = try XCTUnwrap(Data(base64Encoded: "H4sIAAAAAAAAA3OP8gxQKEiszMlPTOECAOZRTLUNAAAA"))
+
+        var corrupt = original
+        corrupt[corrupt.count - 8] ^= 0xff
+        let corruptURL = root.appending(path: "corrupt.gz")
+        try corrupt.write(to: corruptURL)
+        let corruptArchive = try ArchiveReader(url: corruptURL)
+        do {
+            _ = try await corruptArchive.data(for: corruptArchive.entries[0])
+            XCTFail("Expected corruptArchive")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .corruptArchive)
+        }
+
+        let largeGZIP = try XCTUnwrap(Data(base64Encoded: "H4sIAAAAAAAAA+3BMQEAAADCoPVP7W0HoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3gAi6g7iAAAEAA=="))
+        var forgedSize = largeGZIP
+        forgedSize.replaceSubrange((forgedSize.count - 4)..<forgedSize.count, with: [1, 0, 0, 0])
+        let forgedURL = root.appending(path: "forged.gz")
+        try forgedSize.write(to: forgedURL)
+        let limits = ArchiveLimits(
+            maximumEntrySize: 1_024,
+            maximumTotalSize: 1_024
+        )
+        let forgedArchive = try ArchiveReader(url: forgedURL, options: .init(limits: limits))
+        do {
+            _ = try await forgedArchive.data(for: forgedArchive.entries[0])
+            XCTFail("Expected resourceLimit")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .resourceLimit)
+        }
+    }
+
+    func testGZIPOriginalFilenameAndTARPayloadRoundTrip() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let document = Data("nested archive document".utf8)
+        let tar = makeTAR(entries: [
+            ("Documents/readme.txt", document, UInt8(ascii: "0")),
+        ])
+        let archiveURL = root.appending(path: "download.gz")
+        try makeGZIP(payload: tar, originalFilename: "bundle.tar").write(to: archiveURL)
+
+        let gzipArchive = try ArchiveReader(url: archiveURL)
+        XCTAssertEqual(gzipArchive.format, .gzip)
+        XCTAssertEqual(gzipArchive.entries.map(\.path), ["bundle.tar"])
+        let streamedTAR = try await gzipArchive.data(for: gzipArchive.entries[0])
+        XCTAssertEqual(streamedTAR, tar)
+
+        let tarURL = root.appending(path: "bundle.tar")
+        try streamedTAR.write(to: tarURL)
+        let tarArchive = try ArchiveReader(url: tarURL, format: .tar)
+        XCTAssertEqual(tarArchive.entries.map(\.path), ["Documents/readme.txt"])
+        let nestedDocument = try await tarArchive.data(for: tarArchive.entries[0])
+        XCTAssertEqual(nestedDocument, document)
+
+        let tgzURL = root.appending(path: "fallback.tgz")
+        try makeGZIP(payload: tar).write(to: tgzURL)
+        XCTAssertEqual(try ArchiveReader(url: tgzURL).entries.map(\.path), ["fallback.tar"])
+    }
+
+    func testEmptyTARIsValid() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archiveURL = root.appending(path: "empty.tar")
+        try Data(repeating: 0, count: 1_024).write(to: archiveURL)
+        let archive = try ArchiveReader(url: archiveURL)
+        XCTAssertEqual(archive.format, .tar)
+        XCTAssertTrue(archive.entries.isEmpty)
+    }
+
+    func testLibarchive7ZipListingStreamingAndExtraction() async throws {
+        let archive = try ArchiveReader(url: fixture("libarchive-standard.7z"))
+        XCTAssertEqual(archive.format, .sevenZip)
+        let entry = try XCTUnwrap(archive.entries.first { $0.path == "目录/内容.txt" })
+        let streamed = try await archive.data(for: entry)
+        XCTAssertEqual(streamed, Data("libarchive fixture payload\n".utf8))
+
+        let destination = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: destination) }
+        try await archive.extract(to: destination)
+        XCTAssertEqual(
+            try Data(contentsOf: destination.appending(path: "目录/内容.txt")),
+            Data("libarchive fixture payload\n".utf8)
+        )
+    }
+
+    func testLibarchiveEncrypted7ZipPasswords() async throws {
+        XCTAssertThrowsError(try ArchiveReader(url: fixture("libarchive-encrypted.7z"))) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsupportedFeature)
+        }
+        XCTAssertThrowsError(
+            try ArchiveReader(
+                url: fixture("libarchive-encrypted.7z"),
+                options: .init(password: "incorrect")
+            )
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsupportedFeature)
+        }
+        XCTAssertThrowsError(
+            try ArchiveReader(
+                url: fixture("libarchive-encrypted.7z"),
+                options: .init(password: "open-sesame")
+            )
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsupportedFeature)
+        }
+    }
+
+    func testLibarchiveCompressedTARFilters() async throws {
+        for name in [
+            "libarchive-bundle.tar.xz",
+            "libarchive-bundle.tar.bz2",
+            "libarchive-bundle.tar.zst",
+            "libarchive-bundle.tar.lz4",
+        ] {
+            let archive = try ArchiveReader(url: fixture(name))
+            XCTAssertEqual(archive.format, .tar, name)
+            let entry = try XCTUnwrap(
+                archive.entries.first { $0.path == "目录/内容.txt" },
+                name
+            )
+            let streamed = try await archive.data(for: entry)
+            XCTAssertEqual(streamed, Data("libarchive fixture payload\n".utf8), name)
+        }
+    }
+
+    func testLibarchiveSecurityLimitsAndCancellation() async throws {
+        XCTAssertThrowsError(
+            try ArchiveReader(url: fixture("libarchive-unsafe.tar.xz"))
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .unsafePath)
+        }
+
+        XCTAssertThrowsError(
+            try ArchiveReader(
+                url: fixture("libarchive-standard.7z"),
+                options: .init(
+                    limits: .init(
+                        maximumEntryCount: 100,
+                        maximumEntrySize: 4,
+                        maximumTotalSize: 100,
+                        maximumCompressionRatio: 1_000
+                    )
+                )
+            )
+        ) { error in
+            XCTAssertEqual((error as? ArchiveError)?.code, .resourceLimit)
+        }
+
+        let archive = try ArchiveReader(url: fixture("libarchive-standard.7z"))
+        let entry = try XCTUnwrap(archive.entries.first { $0.path == "目录/内容.txt" })
+        do {
+            try await archive.read(entry) { _ in false }
+            XCTFail("Expected cancellation")
+        } catch let error as ArchiveError {
+            XCTAssertEqual(error.code, .cancelled)
+        }
+    }
+
     private func fixture(_ name: String) -> URL {
         Bundle.module.url(forResource: name, withExtension: nil, subdirectory: "Fixtures")!
     }
@@ -388,6 +718,87 @@ final class SwiftArchiveTests: XCTestCase {
         data.appendLE(centralOffset)
         data.appendLE(UInt16(0))
         return data
+    }
+
+    private func makeTAR(entries: [(path: String, data: Data, type: UInt8)]) -> Data {
+        var archive = Data()
+        for entry in entries {
+            var header = Data(repeating: 0, count: 512)
+            header.replaceSubrange(0..<min(entry.path.utf8.count, 100), with: entry.path.utf8.prefix(100))
+            writeTAROctal(0o644, to: &header, offset: 100, length: 8)
+            writeTAROctal(0, to: &header, offset: 108, length: 8)
+            writeTAROctal(0, to: &header, offset: 116, length: 8)
+            writeTAROctal(UInt64(entry.data.count), to: &header, offset: 124, length: 12)
+            writeTAROctal(1_700_000_000, to: &header, offset: 136, length: 12)
+            header.replaceSubrange(148..<156, with: Data(repeating: 0x20, count: 8))
+            header[156] = entry.type
+            header.replaceSubrange(257..<263, with: Data("ustar\0".utf8))
+            header.replaceSubrange(263..<265, with: Data("00".utf8))
+            let checksum = header.reduce(UInt64(0)) { $0 + UInt64($1) }
+            let checksumString = String(format: "%06llo\0 ", checksum)
+            header.replaceSubrange(148..<156, with: checksumString.utf8)
+            archive.append(header)
+            archive.append(entry.data)
+            let padding = (512 - entry.data.count % 512) % 512
+            archive.append(Data(repeating: 0, count: padding))
+        }
+        archive.append(Data(repeating: 0, count: 1024))
+        return archive
+    }
+
+    private func makePAXRecord(key: String, value: String) -> String {
+        let body = " \(key)=\(value)\n"
+        var length = body.utf8.count + 1
+        while true {
+            let candidate = "\(length)\(body)"
+            let actualLength = candidate.utf8.count
+            if actualLength == length { return candidate }
+            length = actualLength
+        }
+    }
+
+    private func makeGZIP(payload: Data, originalFilename: String? = nil) -> Data {
+        var archive = Data([0x1f, 0x8b, 0x08, originalFilename == nil ? 0 : 0x08])
+        archive.append(contentsOf: [0, 0, 0, 0, 0, 3])
+        if let originalFilename {
+            archive.append(contentsOf: originalFilename.utf8)
+            archive.append(0)
+        }
+
+        if payload.isEmpty {
+            archive.append(contentsOf: [1, 0, 0, 0xff, 0xff])
+        } else {
+            var offset = 0
+            while offset < payload.count {
+                let count = min(65_535, payload.count - offset)
+                let isFinal = offset + count == payload.count
+                archive.append(isFinal ? 1 : 0)
+                archive.appendLE(UInt16(count))
+                archive.appendLE(~UInt16(count))
+                archive.append(payload[offset..<(offset + count)])
+                offset += count
+            }
+        }
+        archive.appendLE(crc32(payload))
+        archive.appendLE(UInt32(truncatingIfNeeded: payload.count))
+        return archive
+    }
+
+    private func crc32(_ data: Data) -> UInt32 {
+        var crc = UInt32.max
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                crc = (crc >> 1) ^ ((crc & 1) == 0 ? 0 : 0xedb8_8320)
+            }
+        }
+        return ~crc
+    }
+
+    private func writeTAROctal(_ value: UInt64, to data: inout Data, offset: Int, length: Int) {
+        let digits = String(value, radix: 8)
+        let padded = String(repeating: "0", count: max(0, length - digits.count - 1)) + digits + "\0"
+        data.replaceSubrange(offset..<(offset + length), with: padded.utf8.prefix(length))
     }
 }
 

@@ -1,0 +1,5 @@
+The files whose names begin with `libarchive-` were generated for this test
+suite from the original UTF-8 text `libarchive fixture payload` using 7-Zip,
+tar, XZ Utils, bzip2, Zstandard, and LZ4. They may be used, copied, modified,
+and distributed without restriction under the CC0 1.0 Universal dedication:
+https://creativecommons.org/publicdomain/zero/1.0/
