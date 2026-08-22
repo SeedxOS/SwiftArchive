@@ -80,10 +80,25 @@ let package = Package(
         .library(name: "SwiftArchive", targets: ["SwiftArchive"]),
         .library(name: "CSwiftArchiveCore", targets: ["CSwiftArchiveCore"]),
     ],
-    dependencies: [
-        .package(path: "Vendor/PLzmaSDK"),
-    ],
     targets: [
+        .target(
+            name: "libplzma",
+            path: "Vendor/PLzmaSDK/src",
+            cSettings: [
+                .define("LIBPLZMA_VERSION_BUILD", to: "1448"),
+            ],
+            cxxSettings: [
+                .define("LIBPLZMA_VERSION_BUILD", to: "1448"),
+            ]
+        ),
+        .target(
+            name: "PLzmaSDK",
+            dependencies: ["libplzma"],
+            path: "Vendor/PLzmaSDK/swift",
+            resources: [
+                .copy("../resources/PrivacyInfo.xcprivacy"),
+            ]
+        ),
         .target(
             name: "CLibLZMA",
             path: "Sources/CLibLZMA",
@@ -230,7 +245,7 @@ let package = Package(
             name: "SwiftArchive",
             dependencies: [
                 "CSwiftArchiveCore",
-                .product(name: "PLzmaSDK", package: "plzmasdk"),
+                "PLzmaSDK",
             ],
             path: "Sources/SwiftArchive",
             resources: [.copy("Resources/PrivacyInfo.xcprivacy")]
